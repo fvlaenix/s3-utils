@@ -18,10 +18,9 @@ _PROPERTIES_ENCODING = "utf-8"
 class S3Config:
     """S3 connection settings."""
 
-    bucket: str
-    region: Optional[str] = None
     access_key: Optional[str] = None
     secret_key: Optional[str] = None
+    session_token: Optional[str] = None
 
 
 def _parse_properties(path: str) -> Dict[str, str]:
@@ -54,28 +53,24 @@ def load_s3_config(path: Optional[str] = None) -> S3Config:
 
     props = _parse_properties(path)
 
-    bucket = props.get("s3.bucket") or props.get("bucket")
-    if not bucket:
-        raise RuntimeError("S3 properties must contain s3.bucket")
-
-    region = props.get("s3.region") or props.get("region")
     access_key = props.get("s3.accessKey") or props.get("accessKey")
     secret_key = props.get("s3.secretKey") or props.get("secretKey")
+    session_token = props.get("s3.sessionToken")
 
     return S3Config(
-        bucket=bucket,
-        region=region,
         access_key=access_key,
         secret_key=secret_key,
+        session_token=session_token,
     )
 
 
-def create_s3_client(cfg: S3Config):
+def create_s3_client(cfg: S3Config, region: Optional[str] = None):
     """
     Create a boto3 S3 client from S3Config.
 
     If access_key / secret_key are not provided in the config, standard
     AWS credential resolution is used (env vars, shared credentials file, etc.).
+    Region can be provided per client call.
     """
     boto_config = BotoConfig(
         signature_version="s3v4",
@@ -85,12 +80,15 @@ def create_s3_client(cfg: S3Config):
     session_kwargs = {}
     client_kwargs = {}
 
-    if cfg.region:
-        client_kwargs["region_name"] = cfg.region
+    if region:
+        client_kwargs["region_name"] = region
 
     if cfg.access_key and cfg.secret_key:
         session_kwargs["aws_access_key_id"] = cfg.access_key
         session_kwargs["aws_secret_access_key"] = cfg.secret_key
+
+    if cfg.session_token:
+        session_kwargs["aws_session_token"] = cfg.session_token
 
     session = boto3.Session(**session_kwargs)
     return session.client(
@@ -149,31 +147,38 @@ def _upload_file(
         progress.close()
 
 
-def upload_to_s3(cfg: S3Config, local_path: str, s3_path: str) -> bool:
+def upload_to_s3(
+    cfg: S3Config,
+    bucket: str,
+    region: Optional[str],
+    local_path: str,
+    s3_path: str,
+) -> bool:
     """
     Upload a file or directory to S3.
 
+    bucket and region are supplied per call.
     If local_path is a directory, it is zipped before upload and s3_path
     must end with .zip.
     """
     if not os.path.exists(local_path):
         raise FileNotFoundError(f"Local path not found: {local_path}")
 
-    s3_client = create_s3_client(cfg)
+    s3_client = create_s3_client(cfg, region)
 
     if os.path.isdir(local_path):
         if not s3_path.endswith(".zip"):
             raise ValueError("Uploading a directory requires s3_path to end with .zip")
         archive_path = _zip_directory(local_path)
         try:
-            return _upload_file(s3_client, cfg.bucket, archive_path, s3_path)
+            return _upload_file(s3_client, bucket, archive_path, s3_path)
         finally:
             try:
                 os.remove(archive_path)
             except OSError:
                 pass
 
-    return _upload_file(s3_client, cfg.bucket, local_path, s3_path)
+    return _upload_file(s3_client, bucket, local_path, s3_path)
 
 
 def _get_object_size(s3_client, bucket: str, key: str) -> Optional[int]:
@@ -184,10 +189,17 @@ def _get_object_size(s3_client, bucket: str, key: str) -> Optional[int]:
         return None
 
 
-def download_from_s3(cfg: S3Config, s3_path: str, local_dir: str) -> bool:
+def download_from_s3(
+    cfg: S3Config,
+    bucket: str,
+    region: Optional[str],
+    s3_path: str,
+    local_dir: str,
+) -> bool:
     """
     Download an S3 object into a local directory.
 
+    bucket and region are supplied per call.
     If the downloaded object is a zip, it is extracted into local_dir
     and the zip file is removed.
     """
@@ -198,14 +210,14 @@ def download_from_s3(cfg: S3Config, s3_path: str, local_dir: str) -> bool:
     filename = os.path.basename(s3_path)
     dest_path = os.path.join(local_dir, filename)
 
-    s3_client = create_s3_client(cfg)
-    total_size = _get_object_size(s3_client, cfg.bucket, s3_path)
+    s3_client = create_s3_client(cfg, region)
+    total_size = _get_object_size(s3_client, bucket, s3_path)
     progress = _ProgressBar(desc=dest_path, total=total_size)
 
     try:
-        s3_client.download_file(cfg.bucket, s3_path, dest_path, Callback=progress)
+        s3_client.download_file(bucket, s3_path, dest_path, Callback=progress)
     except (BotoCoreError, ClientError) as exc:
-        print(f"[WARN] Failed to download s3://{cfg.bucket}/{s3_path} -> {dest_path}: {exc}")
+        print(f"[WARN] Failed to download s3://{bucket}/{s3_path} -> {dest_path}: {exc}")
         return False
     finally:
         progress.close()
