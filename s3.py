@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import posixpath
+import shutil
+import tarfile
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -189,6 +193,30 @@ def _get_object_size(s3_client, bucket: str, key: str) -> Optional[int]:
         return None
 
 
+def _download_object(s3_client, bucket: str, key: str, dest_path: str) -> bool:
+    total_size = _get_object_size(s3_client, bucket, key)
+    progress = _ProgressBar(desc=dest_path, total=total_size)
+    try:
+        s3_client.download_file(bucket, key, dest_path, Callback=progress)
+        return True
+    except (BotoCoreError, ClientError) as exc:
+        print(f"[WARN] Failed to download s3://{bucket}/{key} -> {dest_path}: {exc}")
+        return False
+    finally:
+        progress.close()
+
+
+def _safe_extract_tar(tar: tarfile.TarFile, dest_dir: str) -> None:
+    base_dir = os.path.abspath(dest_dir)
+    for member in tar.getmembers():
+        if member.islnk() or member.issym():
+            raise ValueError(f"Symlink not allowed in tar: {member.name}")
+        member_path = os.path.abspath(os.path.join(base_dir, member.name))
+        if os.path.commonpath([base_dir, member_path]) != base_dir:
+            raise ValueError(f"Unsafe path in tar: {member.name}")
+    tar.extractall(dest_dir)
+
+
 def download_from_s3(
     cfg: S3Config,
     bucket: str,
@@ -229,5 +257,103 @@ def download_from_s3(
             os.remove(dest_path)
         except OSError:
             pass
+
+    return True
+
+
+def download_snapshot_from_s3(
+    cfg: S3Config,
+    bucket: str,
+    region: Optional[str],
+    manifest_s3_path: str,
+    local_dir: str,
+) -> bool:
+    """
+    Download snapshot chunks listed in manifest.json and merge them into local_dir.
+
+    The output contains a merged manifest.jsonl and the merged images/tags/scores folders.
+    """
+    if not manifest_s3_path or manifest_s3_path.endswith("/"):
+        raise ValueError("manifest_s3_path must be an object key, not a prefix")
+
+    if os.path.exists(local_dir) and os.listdir(local_dir):
+        raise ValueError(f"local_dir must be empty or non-existent: {local_dir}")
+
+    os.makedirs(local_dir, exist_ok=True)
+
+    s3_client = create_s3_client(cfg, region)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+        manifest_path = tmp.name
+
+    try:
+        if not _download_object(s3_client, bucket, manifest_s3_path, manifest_path):
+            return False
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    finally:
+        try:
+            os.remove(manifest_path)
+        except OSError:
+            pass
+
+    chunk_paths = manifest.get("chunk_paths")
+    if not isinstance(chunk_paths, list) or not chunk_paths:
+        raise ValueError("manifest.json must include a non-empty chunk_paths list")
+
+    prefix = posixpath.dirname(manifest_s3_path)
+    merged_manifest_path = os.path.join(local_dir, "manifest.jsonl")
+
+    for chunk_path in chunk_paths:
+        if not isinstance(chunk_path, str) or not chunk_path:
+            raise ValueError("chunk_paths must contain non-empty strings")
+        if posixpath.isabs(chunk_path):
+            raise ValueError(f"chunk_path must be relative: {chunk_path}")
+
+        chunk_key = posixpath.join(prefix, chunk_path) if prefix else chunk_path
+        chunk_suffix = os.path.splitext(posixpath.basename(chunk_path))[1] or ".tar"
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=chunk_suffix) as tmp_chunk:
+            tmp_chunk_path = tmp_chunk.name
+
+        try:
+            if not _download_object(s3_client, bucket, chunk_key, tmp_chunk_path):
+                return False
+
+            if not tarfile.is_tarfile(tmp_chunk_path):
+                raise ValueError(f"Chunk is not a tar file: {chunk_path}")
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                with tarfile.open(tmp_chunk_path, "r:*") as tar:
+                    _safe_extract_tar(tar, tmp_dir)
+
+                chunk_manifest_path = os.path.join(tmp_dir, "manifest.jsonl")
+                if not os.path.exists(chunk_manifest_path):
+                    raise ValueError(f"Chunk missing manifest.jsonl: {chunk_path}")
+
+                with open(merged_manifest_path, "a", encoding="utf-8") as merged:
+                    with open(chunk_manifest_path, "r", encoding="utf-8") as chunk_manifest:
+                        for line in chunk_manifest:
+                            if line.endswith("\n"):
+                                merged.write(line)
+                            else:
+                                merged.write(f"{line}\n")
+
+                for root, _, files in os.walk(tmp_dir):
+                    for filename in files:
+                        src_path = os.path.join(root, filename)
+                        rel_path = os.path.relpath(src_path, start=tmp_dir)
+                        if rel_path == "manifest.jsonl":
+                            continue
+                        dest_path = os.path.join(local_dir, rel_path)
+                        if os.path.exists(dest_path):
+                            raise FileExistsError(f"Conflict while merging: {dest_path}")
+                        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                        shutil.move(src_path, dest_path)
+        finally:
+            try:
+                os.remove(tmp_chunk_path)
+            except OSError:
+                pass
 
     return True
