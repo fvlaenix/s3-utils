@@ -4,12 +4,14 @@ import json
 import os
 import posixpath
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from queue import Queue
-from threading import Thread
+from threading import Lock
 from typing import Any, Dict, Optional
 
 import boto3
@@ -293,15 +295,16 @@ def _ensure_manifest_offset(path: str, expected_size: int) -> None:
             f.truncate(expected_size)
 
 
-def _stream_extract_chunk(
-    chunk_tar_path: str,
-    local_dir: str,
-    merged_manifest_path: str,
-    *,
-    verify_existing_files: bool,
-) -> int:
-    local_dir_abs = os.path.abspath(local_dir)
+@dataclass
+class _ChunkInspection:
+    manifest_blob: bytes
+    file_paths: list[str]
+
+
+def _inspect_chunk_tar(chunk_tar_path: str) -> _ChunkInspection:
     manifest_blob: Optional[bytes] = None
+    file_paths: list[str] = []
+    seen_paths: set[str] = set()
 
     with tarfile.open(chunk_tar_path, "r:*") as tar:
         for member in tar:
@@ -309,6 +312,9 @@ def _stream_extract_chunk(
                 raise ValueError(f"Symlink not allowed in tar: {member.name}")
 
             normalized = _normalize_archive_path(member.name)
+            if normalized in seen_paths:
+                raise ValueError(f"Duplicate tar entry in chunk: {member.name}")
+            seen_paths.add(normalized)
 
             if member.isdir():
                 continue
@@ -317,36 +323,44 @@ def _stream_extract_chunk(
                 raise ValueError(f"Unsupported tar entry type: {member.name}")
 
             if normalized == "manifest.jsonl":
-                if manifest_blob is not None:
-                    raise ValueError("Chunk contains duplicate manifest.jsonl files")
                 extracted_manifest = tar.extractfile(member)
                 if extracted_manifest is None:
                     raise ValueError("Failed to read manifest.jsonl from chunk")
                 manifest_blob = _normalize_manifest_blob(extracted_manifest.read())
                 continue
 
-            dest_path = os.path.abspath(os.path.join(local_dir_abs, normalized))
-            if os.path.commonpath([local_dir_abs, dest_path]) != local_dir_abs:
-                raise ValueError(f"Unsafe path in tar: {member.name}")
+            file_paths.append(normalized)
 
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    if manifest_blob is None:
+        raise ValueError(f"Chunk missing manifest.jsonl: {chunk_tar_path}")
 
-            if os.path.exists(dest_path):
-                if not os.path.isfile(dest_path):
-                    raise FileExistsError(f"Conflict while merging: {dest_path}")
-                if verify_existing_files:
-                    if os.path.getsize(dest_path) != member.size:
-                        raise FileExistsError(f"Conflict while merging: {dest_path}")
+    return _ChunkInspection(manifest_blob=manifest_blob, file_paths=file_paths)
+
+
+def _extract_chunk_with_python_tar(chunk_tar_path: str, staging_dir: str) -> None:
+    with tarfile.open(chunk_tar_path, "r:*") as tar:
+        for member in tar:
+            normalized = _normalize_archive_path(member.name)
+            if normalized == "manifest.jsonl" or member.isdir():
+                continue
+            if not member.isfile():
                 continue
 
             extracted = tar.extractfile(member)
             if extracted is None:
                 raise ValueError(f"Failed to read tar entry: {member.name}")
 
+            dest_path = os.path.abspath(os.path.join(staging_dir, normalized))
+            if os.path.commonpath([os.path.abspath(staging_dir), dest_path]) != os.path.abspath(
+                staging_dir
+            ):
+                raise ValueError(f"Unsafe path in tar: {member.name}")
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
             part_path = f"{dest_path}.part"
             try:
                 with open(part_path, "wb") as out:
-                    shutil.copyfileobj(extracted, out, length=1024 * 1024)
+                    shutil.copyfileobj(extracted, out, length=4 * 1024 * 1024)
                 os.replace(part_path, dest_path)
             finally:
                 if os.path.exists(part_path):
@@ -355,14 +369,69 @@ def _stream_extract_chunk(
                     except OSError:
                         pass
 
-    if manifest_blob is None:
-        raise ValueError(f"Chunk missing manifest.jsonl: {chunk_tar_path}")
 
-    with open(merged_manifest_path, "ab") as merged:
-        merged.write(manifest_blob)
-        merged.flush()
-        os.fsync(merged.fileno())
-    return len(manifest_blob)
+def _extract_chunk_with_system_tar(
+    *,
+    system_tar_path: str,
+    chunk_tar_path: str,
+    staging_dir: str,
+) -> None:
+    cmd = [
+        system_tar_path,
+        "-xf",
+        chunk_tar_path,
+        "-C",
+        staging_dir,
+        "--exclude=manifest.jsonl",
+        "--no-same-owner",
+        "--no-same-permissions",
+        "--delay-directory-restore",
+    ]
+    completed = subprocess.run(
+        cmd,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        if stderr:
+            raise RuntimeError(f"tar extraction failed: {stderr}")
+        raise RuntimeError("tar extraction failed")
+
+
+def _merge_staged_chunk(
+    *,
+    staging_dir: str,
+    local_dir: str,
+    file_paths: list[str],
+    verify_existing_files: bool,
+) -> None:
+    staging_abs = os.path.abspath(staging_dir)
+    local_abs = os.path.abspath(local_dir)
+
+    for rel_path in file_paths:
+        src_path = os.path.abspath(os.path.join(staging_abs, rel_path))
+        if os.path.commonpath([staging_abs, src_path]) != staging_abs:
+            raise ValueError(f"Unsafe staged path: {rel_path}")
+        if not os.path.isfile(src_path):
+            raise FileNotFoundError(f"Expected extracted file is missing: {src_path}")
+
+        dest_path = os.path.abspath(os.path.join(local_abs, rel_path))
+        if os.path.commonpath([local_abs, dest_path]) != local_abs:
+            raise ValueError(f"Unsafe destination path: {rel_path}")
+
+        if os.path.exists(dest_path):
+            if verify_existing_files:
+                if not os.path.isfile(dest_path):
+                    raise FileExistsError(f"Conflict while merging: {dest_path}")
+                if os.path.getsize(dest_path) != os.path.getsize(src_path):
+                    raise FileExistsError(f"Conflict while merging: {dest_path}")
+            raise FileExistsError(f"Conflict while merging: {dest_path}")
+
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        os.replace(src_path, dest_path)
 
 
 def download_from_s3(
@@ -419,6 +488,9 @@ def download_snapshot_from_s3(
     resume: bool = True,
     prefetch_chunks: int = 2,
     verify_existing_files: bool = True,
+    download_workers: Optional[int] = None,
+    extract_workers: Optional[int] = None,
+    prefer_system_tar: bool = True,
 ) -> bool:
     """
     Download snapshot chunks listed in manifest.json and merge them into local_dir.
@@ -431,6 +503,17 @@ def download_snapshot_from_s3(
 
     if prefetch_chunks < 1:
         raise ValueError("prefetch_chunks must be >= 1")
+
+    if download_workers is None:
+        download_workers = max(1, prefetch_chunks)
+    if extract_workers is None:
+        cpu_count = os.cpu_count() or 2
+        extract_workers = max(1, min(8, cpu_count))
+
+    if download_workers < 1:
+        raise ValueError("download_workers must be >= 1")
+    if extract_workers < 1:
+        raise ValueError("extract_workers must be >= 1")
 
     if os.path.exists(local_dir) and os.listdir(local_dir) and not resume:
         raise ValueError(
@@ -534,7 +617,7 @@ def download_snapshot_from_s3(
     _save_json_atomic(state_path, existing_state)
 
     @dataclass
-    class _ChunkDownloadResult:
+    class _ChunkPlan:
         index: int
         chunk_path: str
         chunk_key: str
@@ -542,167 +625,240 @@ def download_snapshot_from_s3(
         content_length: Optional[int]
         etag: Optional[str]
         skip_processing: bool
-        error: Optional[str] = None
 
-    queue: "Queue[Optional[_ChunkDownloadResult]]" = Queue(maxsize=prefetch_chunks)
+    @dataclass
+    class _PreparedChunk:
+        index: int
+        chunk_path: str
+        chunk_key: str
+        cache_path: str
+        content_length: Optional[int]
+        etag: Optional[str]
+        staging_dir: str
+        file_paths: list[str]
+        manifest_blob: bytes
 
-    def _download_worker() -> None:
-        for index, chunk_path in enumerate(chunk_paths):
-            chunk_key = ""
-            try:
-                chunk_key = posixpath.join(prefix, chunk_path) if prefix else chunk_path
-                chunk_suffix = os.path.splitext(posixpath.basename(chunk_path))[1] or ".tar"
-                chunk_cache_path = os.path.join(
-                    chunks_cache_dir,
-                    f"{index:06d}{chunk_suffix}",
-                )
+    chunk_plans: list[_ChunkPlan] = []
+    for index, chunk_path in enumerate(chunk_paths):
+        chunk_key = posixpath.join(prefix, chunk_path) if prefix else chunk_path
+        chunk_suffix = os.path.splitext(posixpath.basename(chunk_path))[1] or ".tar"
+        chunk_cache_path = os.path.join(
+            chunks_cache_dir,
+            f"{index:06d}{chunk_suffix}",
+        )
 
-                chunk_head = _head_object(s3_client, bucket, chunk_key)
-                content_length = (
-                    chunk_head.get("ContentLength") if chunk_head is not None else None
-                )
-                etag = chunk_head.get("ETag") if chunk_head is not None else None
+        chunk_head = _head_object(s3_client, bucket, chunk_key)
+        content_length = chunk_head.get("ContentLength") if chunk_head is not None else None
+        etag = chunk_head.get("ETag") if chunk_head is not None else None
 
-                cached_chunk_state = completed_chunks.get(str(index))
-                if isinstance(cached_chunk_state, dict) and cached_chunk_state.get(
-                    "chunk_path"
-                ) == chunk_path:
-                    size_matches = True
-                    if (
-                        content_length is not None
-                        and cached_chunk_state.get("content_length") is not None
-                    ):
-                        size_matches = (
-                            int(cached_chunk_state["content_length"]) == content_length
+        cached_chunk_state = completed_chunks.get(str(index))
+        skip_processing = False
+        if isinstance(cached_chunk_state, dict) and cached_chunk_state.get("chunk_path") == chunk_path:
+            size_matches = True
+            if content_length is not None and cached_chunk_state.get("content_length") is not None:
+                size_matches = int(cached_chunk_state["content_length"]) == content_length
+            etag_matches = True
+            if etag and cached_chunk_state.get("etag"):
+                etag_matches = cached_chunk_state["etag"] == etag
+            skip_processing = size_matches and etag_matches
+
+        chunk_plans.append(
+            _ChunkPlan(
+                index=index,
+                chunk_path=chunk_path,
+                chunk_key=chunk_key,
+                cache_path=chunk_cache_path,
+                content_length=content_length,
+                etag=etag,
+                skip_processing=skip_processing,
+            )
+        )
+
+    chunks_to_download = [plan for plan in chunk_plans if not plan.skip_processing]
+
+    def _ensure_chunk_cache(plan: _ChunkPlan) -> None:
+        cache_is_valid = False
+        if os.path.exists(plan.cache_path) and os.path.isfile(plan.cache_path):
+            cache_is_valid = True
+            if plan.content_length is not None:
+                cache_is_valid = os.path.getsize(plan.cache_path) == plan.content_length
+
+        if cache_is_valid:
+            return
+
+        chunk_tmp_path = f"{plan.cache_path}.download"
+        try:
+            s3_client.download_file(bucket, plan.chunk_key, chunk_tmp_path)
+            os.replace(chunk_tmp_path, plan.cache_path)
+        finally:
+            if os.path.exists(chunk_tmp_path):
+                try:
+                    os.remove(chunk_tmp_path)
+                except OSError:
+                    pass
+
+        if plan.content_length is not None and os.path.getsize(plan.cache_path) != plan.content_length:
+            raise RuntimeError(f"Downloaded chunk size mismatch: s3://{bucket}/{plan.chunk_key}")
+
+    download_progress = tqdm(total=len(chunks_to_download), unit="chunk", desc="chunk cache")
+    try:
+        if chunks_to_download:
+            with ThreadPoolExecutor(max_workers=download_workers) as download_pool:
+                future_map = {
+                    download_pool.submit(_ensure_chunk_cache, plan): plan.index
+                    for plan in chunks_to_download
+                }
+                for future in as_completed(future_map):
+                    index = future_map[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        print(
+                            f"[WARN] Snapshot download failed: failed to cache chunk {index + 1}/{len(chunk_paths)}: {exc}"
                         )
-                    etag_matches = True
-                    if etag and cached_chunk_state.get("etag"):
-                        etag_matches = cached_chunk_state["etag"] == etag
-                    if size_matches and etag_matches:
-                        queue.put(
-                            _ChunkDownloadResult(
-                                index=index,
-                                chunk_path=chunk_path,
-                                chunk_key=chunk_key,
-                                cache_path=chunk_cache_path,
-                                content_length=content_length,
-                                etag=etag,
-                                skip_processing=True,
+                        return False
+                    download_progress.update(1)
+    finally:
+        download_progress.close()
+
+    system_tar_path: Optional[str] = None
+    use_system_tar = False
+    if prefer_system_tar:
+        if not sys.platform.startswith("linux"):
+            print(
+                "[WARN] Fast extractor is optimized for Linux; falling back to Python tarfile extraction."
+            )
+        else:
+            system_tar_path = shutil.which("tar")
+            if system_tar_path is None:
+                print(
+                    "[WARN] 'tar' not found; falling back to Python tarfile extraction (slower)."
+                )
+            else:
+                use_system_tar = True
+
+    staging_root = os.path.join(cache_root, "staging")
+    os.makedirs(staging_root, exist_ok=True)
+
+    fallback_warned = False
+    fallback_warn_lock = Lock()
+
+    def _prepare_chunk(plan: _ChunkPlan) -> _PreparedChunk:
+        nonlocal fallback_warned
+        inspection = _inspect_chunk_tar(plan.cache_path)
+        staging_dir = os.path.join(staging_root, f"{plan.index:06d}")
+
+        if os.path.exists(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        os.makedirs(staging_dir, exist_ok=True)
+
+        try:
+            if use_system_tar and system_tar_path is not None:
+                try:
+                    _extract_chunk_with_system_tar(
+                        system_tar_path=system_tar_path,
+                        chunk_tar_path=plan.cache_path,
+                        staging_dir=staging_dir,
+                    )
+                except Exception:
+                    with fallback_warn_lock:
+                        if not fallback_warned:
+                            print(
+                                "[WARN] Fast extraction via system tar failed; falling back to Python tarfile extraction."
                             )
-                        )
+                            fallback_warned = True
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    os.makedirs(staging_dir, exist_ok=True)
+                    _extract_chunk_with_python_tar(plan.cache_path, staging_dir)
+            else:
+                _extract_chunk_with_python_tar(plan.cache_path, staging_dir)
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
+        return _PreparedChunk(
+            index=plan.index,
+            chunk_path=plan.chunk_path,
+            chunk_key=plan.chunk_key,
+            cache_path=plan.cache_path,
+            content_length=plan.content_length,
+            etag=plan.etag,
+            staging_dir=staging_dir,
+            file_paths=inspection.file_paths,
+            manifest_blob=inspection.manifest_blob,
+        )
+
+    max_pending_prepared = max(prefetch_chunks, extract_workers * 2)
+    pending_futures: Dict[int, Future[_PreparedChunk]] = {}
+    next_plan_to_submit = 0
+
+    def _fill_pending(extract_pool: ThreadPoolExecutor) -> None:
+        nonlocal next_plan_to_submit
+        while next_plan_to_submit < len(chunk_plans) and len(pending_futures) < max_pending_prepared:
+            plan = chunk_plans[next_plan_to_submit]
+            next_plan_to_submit += 1
+            if plan.skip_processing:
+                continue
+            pending_futures[plan.index] = extract_pool.submit(_prepare_chunk, plan)
+
+    stream_error: Optional[str] = None
+    chunk_progress = tqdm(total=len(chunk_paths), unit="chunk", desc="chunks")
+    try:
+        with ThreadPoolExecutor(max_workers=extract_workers) as extract_pool:
+            _fill_pending(extract_pool)
+            with open(merged_manifest_path, "ab") as merged_manifest:
+                for plan in chunk_plans:
+                    if plan.skip_processing:
+                        chunk_progress.update(1)
+                        _fill_pending(extract_pool)
                         continue
 
-                cache_is_valid = False
-                if os.path.exists(chunk_cache_path) and os.path.isfile(chunk_cache_path):
-                    cache_is_valid = True
-                    if content_length is not None:
-                        cache_is_valid = os.path.getsize(chunk_cache_path) == content_length
+                    future = pending_futures.pop(plan.index, None)
+                    if future is None:
+                        stream_error = f"Missing chunk prepare result for index {plan.index}"
+                        break
 
-                if not cache_is_valid:
-                    chunk_tmp_path = f"{chunk_cache_path}.download"
                     try:
-                        if not _download_object(
-                            s3_client,
-                            bucket,
-                            chunk_key,
-                            chunk_tmp_path,
-                            desc=f"chunk {index + 1}/{len(chunk_paths)}",
-                            total_size=content_length,
-                        ):
-                            raise RuntimeError(
-                                f"Failed to download chunk: s3://{bucket}/{chunk_key}"
-                            )
-                        os.replace(chunk_tmp_path, chunk_cache_path)
-                    finally:
-                        if os.path.exists(chunk_tmp_path):
-                            try:
-                                os.remove(chunk_tmp_path)
-                            except OSError:
-                                pass
-                    if content_length is not None and os.path.getsize(
-                        chunk_cache_path
-                    ) != content_length:
-                        raise RuntimeError(
-                            f"Downloaded chunk size mismatch: s3://{bucket}/{chunk_key}"
+                        prepared = future.result()
+                    except Exception as exc:
+                        stream_error = (
+                            f"Failed to extract chunk {plan.index + 1}/{len(chunk_paths)}: {exc}"
                         )
+                        break
 
-                queue.put(
-                    _ChunkDownloadResult(
-                        index=index,
-                        chunk_path=chunk_path,
-                        chunk_key=chunk_key,
-                        cache_path=chunk_cache_path,
-                        content_length=content_length,
-                        etag=etag,
-                        skip_processing=False,
+                    try:
+                        _merge_staged_chunk(
+                            staging_dir=prepared.staging_dir,
+                            local_dir=local_dir,
+                            file_paths=prepared.file_paths,
+                            verify_existing_files=verify_existing_files,
+                        )
+                        merged_manifest.write(prepared.manifest_blob)
+                        merged_manifest.flush()
+                        os.fsync(merged_manifest.fileno())
+                    finally:
+                        shutil.rmtree(prepared.staging_dir, ignore_errors=True)
+
+                    existing_state["merged_manifest_bytes"] = (
+                        int(existing_state.get("merged_manifest_bytes", 0))
+                        + len(prepared.manifest_blob)
                     )
-                )
-            except Exception as exc:
-                queue.put(
-                    _ChunkDownloadResult(
-                        index=index,
-                        chunk_path=chunk_path,
-                        chunk_key=chunk_key,
-                        cache_path="",
-                        content_length=None,
-                        etag=None,
-                        skip_processing=False,
-                        error=str(exc),
-                    )
-                )
-                queue.put(None)
-                return
-        queue.put(None)
+                    completed_chunks[str(plan.index)] = {
+                        "chunk_path": plan.chunk_path,
+                        "chunk_key": plan.chunk_key,
+                        "etag": plan.etag,
+                        "content_length": plan.content_length,
+                    }
+                    _save_json_atomic(state_path, existing_state)
+                    chunk_progress.update(1)
+                    _fill_pending(extract_pool)
 
-    downloader = Thread(target=_download_worker, daemon=True)
-    downloader.start()
-
-    results_by_index: Dict[int, _ChunkDownloadResult] = {}
-    chunk_progress = tqdm(total=len(chunk_paths), unit="chunk", desc="chunks")
-    stream_error: Optional[str] = None
-
-    try:
-        for index, chunk_path in enumerate(chunk_paths):
-            while index not in results_by_index:
-                item = queue.get()
-                if item is None:
-                    break
-                results_by_index[item.index] = item
-
-            result = results_by_index.pop(index, None)
-            if result is None:
-                stream_error = f"Missing chunk download result for index {index}"
-                break
-            if result.error:
-                stream_error = result.error
-                break
-
-            if result.skip_processing:
-                chunk_progress.update(1)
-                continue
-
-            manifest_bytes_written = _stream_extract_chunk(
-                result.cache_path,
-                local_dir,
-                merged_manifest_path,
-                verify_existing_files=verify_existing_files,
-            )
-
-            existing_state["merged_manifest_bytes"] = (
-                int(existing_state.get("merged_manifest_bytes", 0))
-                + manifest_bytes_written
-            )
-            completed_chunks[str(index)] = {
-                "chunk_path": chunk_path,
-                "chunk_key": result.chunk_key,
-                "etag": result.etag,
-                "content_length": result.content_length,
-            }
-            _save_json_atomic(state_path, existing_state)
-            chunk_progress.update(1)
+            if stream_error is not None:
+                for future in pending_futures.values():
+                    future.cancel()
     finally:
         chunk_progress.close()
-        downloader.join()
+        shutil.rmtree(staging_root, ignore_errors=True)
 
     if stream_error is not None:
         print(f"[WARN] Snapshot download failed: {stream_error}")
