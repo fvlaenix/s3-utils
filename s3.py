@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,17 @@ from tqdm import tqdm
 _PROPERTIES_ENCODING = "utf-8"
 _SNAPSHOT_STATE_VERSION = 1
 _SNAPSHOT_CACHE_DIR = ".snapshot_cache"
+_ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+_MANIFEST_ALLOWED_FIELDS = {
+    "external_id",
+    "image_path",
+    "tags_path",
+    "scores_path",
+    "width",
+    "height",
+}
+_SOURCE_LABEL_RE = re.compile(r"^[a-z0-9._-]{1,64}$")
+_SOURCE_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9 ._\-:@()\[\]{}+,=;!$'~]{1,512}$")
 
 
 @dataclass
@@ -245,6 +257,146 @@ def _normalize_manifest_blob(raw: bytes) -> bytes:
     return normalized.encode("utf-8")
 
 
+def _validate_external_id(external_id: str) -> None:
+    if ":" not in external_id:
+        raise ValueError(f"Invalid external_id (missing ':'): {external_id}")
+    source_label, source_item_id = external_id.split(":", 1)
+
+    if not _SOURCE_LABEL_RE.fullmatch(source_label):
+        raise ValueError(f"Invalid source_label in external_id: {external_id}")
+    if not _SOURCE_ITEM_ID_RE.fullmatch(source_item_id):
+        raise ValueError(f"Invalid source_item_id in external_id: {external_id}")
+
+    if source_item_id != source_item_id.strip():
+        raise ValueError(f"Invalid source_item_id whitespace in external_id: {external_id}")
+    if ".." in source_item_id:
+        raise ValueError(f"Invalid source_item_id '..' in external_id: {external_id}")
+    if "/" in source_item_id or "\\" in source_item_id:
+        raise ValueError(f"Invalid source_item_id path separator in external_id: {external_id}")
+    if "\0" in source_item_id or "\n" in source_item_id or "\r" in source_item_id:
+        raise ValueError(f"Invalid source_item_id control character in external_id: {external_id}")
+
+
+def _normalize_manifest_entry_path(path: Any, field_name: str) -> str:
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return _normalize_archive_path(path)
+
+
+def _validate_chunk_manifest_entries(
+    *,
+    chunk_tar_path: str,
+    manifest_blob: bytes,
+    file_paths: list[str],
+) -> None:
+    manifest_text = manifest_blob.decode("utf-8")
+    lines = manifest_text.splitlines()
+    files_set = set(file_paths)
+    seen_external_ids: set[str] = set()
+
+    for line_no, line in enumerate(lines, start=1):
+        if line == "":
+            raise ValueError(
+                f"manifest.jsonl in {chunk_tar_path} contains an empty line at {line_no}"
+            )
+
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid JSON in manifest.jsonl ({chunk_tar_path}:{line_no}): {exc}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"manifest.jsonl line must be an object ({chunk_tar_path}:{line_no})"
+            )
+
+        unknown_fields = set(payload.keys()) - _MANIFEST_ALLOWED_FIELDS
+        if unknown_fields:
+            unknown = ", ".join(sorted(unknown_fields))
+            raise ValueError(
+                f"manifest.jsonl has unsupported fields ({chunk_tar_path}:{line_no}): {unknown}"
+            )
+
+        if "external_id" not in payload or "image_path" not in payload:
+            raise ValueError(
+                f"manifest.jsonl line missing required fields ({chunk_tar_path}:{line_no})"
+            )
+
+        external_id = payload["external_id"]
+        if not isinstance(external_id, str) or not external_id:
+            raise ValueError(
+                f"external_id must be a non-empty string ({chunk_tar_path}:{line_no})"
+            )
+        _validate_external_id(external_id)
+        if external_id in seen_external_ids:
+            raise ValueError(
+                f"Duplicate external_id in chunk manifest ({chunk_tar_path}:{line_no}): {external_id}"
+            )
+        seen_external_ids.add(external_id)
+
+        image_path = _normalize_manifest_entry_path(payload["image_path"], "image_path")
+        if image_path not in files_set:
+            raise ValueError(
+                f"manifest.jsonl references missing image file ({chunk_tar_path}:{line_no}): {image_path}"
+            )
+        if not image_path.startswith("images/"):
+            raise ValueError(
+                f"image_path must be under images/ ({chunk_tar_path}:{line_no}): {image_path}"
+            )
+        image_basename = posixpath.basename(image_path)
+        if "." not in image_basename:
+            raise ValueError(
+                f"image_path must include extension ({chunk_tar_path}:{line_no}): {image_path}"
+            )
+        image_stem, image_ext = image_basename.rsplit(".", 1)
+        if image_stem != external_id:
+            raise ValueError(
+                f"image_path must match external_id ({chunk_tar_path}:{line_no})"
+            )
+        if image_ext.lower() not in _ALLOWED_IMAGE_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported image extension in image_path ({chunk_tar_path}:{line_no}): {image_ext}"
+            )
+
+        if "tags_path" in payload:
+            tags_path = _normalize_manifest_entry_path(payload["tags_path"], "tags_path")
+            if tags_path not in files_set:
+                raise ValueError(
+                    f"manifest.jsonl references missing tags file ({chunk_tar_path}:{line_no}): {tags_path}"
+                )
+            if tags_path != f"tags/{external_id}.txt":
+                raise ValueError(
+                    f"tags_path must match external_id ({chunk_tar_path}:{line_no})"
+                )
+
+        if "scores_path" in payload:
+            scores_path = _normalize_manifest_entry_path(payload["scores_path"], "scores_path")
+            if scores_path not in files_set:
+                raise ValueError(
+                    f"manifest.jsonl references missing scores file ({chunk_tar_path}:{line_no}): {scores_path}"
+                )
+            if scores_path != f"scores/{external_id}.jsonl":
+                raise ValueError(
+                    f"scores_path must match external_id ({chunk_tar_path}:{line_no})"
+                )
+
+        if "width" in payload:
+            width = payload["width"]
+            if not isinstance(width, int) or width <= 0:
+                raise ValueError(
+                    f"width must be a positive integer ({chunk_tar_path}:{line_no})"
+                )
+
+        if "height" in payload:
+            height = payload["height"]
+            if not isinstance(height, int) or height <= 0:
+                raise ValueError(
+                    f"height must be a positive integer ({chunk_tar_path}:{line_no})"
+                )
+
+
 def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
     parent = os.path.dirname(path)
     os.makedirs(parent, exist_ok=True)
@@ -333,6 +485,12 @@ def _inspect_chunk_tar(chunk_tar_path: str) -> _ChunkInspection:
 
     if manifest_blob is None:
         raise ValueError(f"Chunk missing manifest.jsonl: {chunk_tar_path}")
+
+    _validate_chunk_manifest_entries(
+        chunk_tar_path=chunk_tar_path,
+        manifest_blob=manifest_blob,
+        file_paths=file_paths,
+    )
 
     return _ChunkInspection(manifest_blob=manifest_blob, file_paths=file_paths)
 

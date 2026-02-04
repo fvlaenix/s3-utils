@@ -254,12 +254,12 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
 
         _write_chunk_tar(
             self._s3_object_path("snapshots/conflict/chunks/000000.tar"),
-            manifest_lines=['{"external_id":"rule34:1","image_path":"images/rule34:dup.png"}'],
+            manifest_lines=['{"external_id":"rule34:dup","image_path":"images/rule34:dup.png"}'],
             files={shared_path: b"first"},
         )
         _write_chunk_tar(
             self._s3_object_path("snapshots/conflict/chunks/000001.tar"),
-            manifest_lines=['{"external_id":"rule34:2","image_path":"images/rule34:dup.png"}'],
+            manifest_lines=['{"external_id":"rule34:dup","image_path":"images/rule34:dup.png"}'],
             files={shared_path: b"second"},
         )
         self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar", "chunks/000001.tar"])
@@ -337,6 +337,148 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
                 download_workers=1,
                 extract_workers=1,
             )
+
+    def test_manifest_line_with_extra_field_is_rejected(self):
+        manifest_key = "snapshots/extra_field/manifest.json"
+        _write_chunk_tar(
+            self._s3_object_path("snapshots/extra_field/chunks/000000.tar"),
+            manifest_lines=[
+                '{"external_id":"rule34:1","image_path":"images/rule34:1.png","extra_field":"bad"}'
+            ],
+            files={"images/rule34:1.png": b"img-1"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+
+        out_dir = self.root / "out_extra_field"
+        result = s3.download_snapshot_from_s3(
+            self.cfg,
+            self.bucket,
+            None,
+            manifest_key,
+            str(out_dir),
+            prefer_system_tar=False,
+            download_workers=1,
+            extract_workers=1,
+        )
+        self.assertFalse(result)
+
+    def test_manifest_empty_line_is_rejected(self):
+        manifest_key = "snapshots/empty_line/manifest.json"
+        _write_chunk_tar(
+            self._s3_object_path("snapshots/empty_line/chunks/000000.tar"),
+            manifest_lines=[
+                '{"external_id":"rule34:1","image_path":"images/rule34:1.png"}',
+                "",
+            ],
+            files={"images/rule34:1.png": b"img-1"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+
+        out_dir = self.root / "out_empty_line"
+        result = s3.download_snapshot_from_s3(
+            self.cfg,
+            self.bucket,
+            None,
+            manifest_key,
+            str(out_dir),
+            prefer_system_tar=False,
+            download_workers=1,
+            extract_workers=1,
+        )
+        self.assertFalse(result)
+
+    def test_manifest_missing_referenced_image_file_is_rejected(self):
+        manifest_key = "snapshots/missing_image_ref/manifest.json"
+        _write_chunk_tar(
+            self._s3_object_path("snapshots/missing_image_ref/chunks/000000.tar"),
+            manifest_lines=['{"external_id":"rule34:1","image_path":"images/rule34:1.png"}'],
+            files={"images/rule34:other.png": b"img-other"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+
+        out_dir = self.root / "out_missing_image_ref"
+        result = s3.download_snapshot_from_s3(
+            self.cfg,
+            self.bucket,
+            None,
+            manifest_key,
+            str(out_dir),
+            prefer_system_tar=False,
+            download_workers=1,
+            extract_workers=1,
+        )
+        self.assertFalse(result)
+
+    def test_manifest_missing_referenced_tags_or_scores_file_is_rejected(self):
+        manifest_key = "snapshots/missing_tags_scores_ref/manifest.json"
+        _write_chunk_tar(
+            self._s3_object_path("snapshots/missing_tags_scores_ref/chunks/000000.tar"),
+            manifest_lines=[
+                '{"external_id":"rule34:1","image_path":"images/rule34:1.png","tags_path":"tags/rule34:1.txt","scores_path":"scores/rule34:1.jsonl"}'
+            ],
+            files={"images/rule34:1.png": b"img-1"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+
+        out_dir = self.root / "out_missing_tags_scores_ref"
+        result = s3.download_snapshot_from_s3(
+            self.cfg,
+            self.bucket,
+            None,
+            manifest_key,
+            str(out_dir),
+            prefer_system_tar=False,
+            download_workers=1,
+            extract_workers=1,
+        )
+        self.assertFalse(result)
+
+    def test_duplicate_external_id_in_single_chunk_is_rejected(self):
+        manifest_key = "snapshots/dup_external_id/manifest.json"
+        _write_chunk_tar(
+            self._s3_object_path("snapshots/dup_external_id/chunks/000000.tar"),
+            manifest_lines=[
+                '{"external_id":"rule34:1","image_path":"images/rule34:1.png"}',
+                '{"external_id":"rule34:1","image_path":"images/rule34:1.png"}',
+            ],
+            files={"images/rule34:1.png": b"img-1"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+
+        out_dir = self.root / "out_dup_external_id"
+        result = s3.download_snapshot_from_s3(
+            self.cfg,
+            self.bucket,
+            None,
+            manifest_key,
+            str(out_dir),
+            prefer_system_tar=False,
+            download_workers=1,
+            extract_workers=1,
+        )
+        self.assertFalse(result)
+
+    def test_unsupported_image_extension_is_rejected(self):
+        manifest_key = "snapshots/bad_ext/manifest.json"
+        _write_chunk_tar(
+            self._s3_object_path("snapshots/bad_ext/chunks/000000.tar"),
+            manifest_lines=['{"external_id":"rule34:1","image_path":"images/rule34:1.gif"}'],
+            files={"images/rule34:1.gif": b"img-1"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+
+        out_dir = self.root / "out_bad_ext"
+        result = s3.download_snapshot_from_s3(
+            self.cfg,
+            self.bucket,
+            None,
+            manifest_key,
+            str(out_dir),
+            prefer_system_tar=False,
+            download_workers=1,
+            extract_workers=1,
+        )
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":
