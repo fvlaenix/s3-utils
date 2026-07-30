@@ -321,6 +321,92 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
         chunk_downloads = [key for _, key, _ in self.client.download_calls if key == chunk_key]
         self.assertEqual(len(chunk_downloads), 1)
 
+    def test_resume_after_merge_before_state_commit_reuses_identical_files(self):
+        manifest_key = "snapshots/interrupted_merge/manifest.json"
+        chunk_key = "snapshots/interrupted_merge/chunks/000000.tar"
+        _write_chunk_tar(
+            self._s3_object_path(chunk_key),
+            manifest_lines=[
+                '{"external_id":"rule34:1","image_path":"images/rule34:1.png","tags_path":"tags/rule34:1.txt"}'
+            ],
+            files={
+                "images/rule34:1.png": b"img-1",
+                "tags/rule34:1.txt": b"tag-one\n",
+            },
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+        out_dir = self.root / "out_interrupted_merge"
+
+        real_save = s3._save_json_atomic
+        save_calls = 0
+
+        def interrupt_after_merge(path, payload):
+            nonlocal save_calls
+            save_calls += 1
+            if save_calls == 2:
+                raise RuntimeError("simulated interruption before state commit")
+            return real_save(path, payload)
+
+        with mock.patch.object(s3, "_save_json_atomic", side_effect=interrupt_after_merge):
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                s3.download_snapshot_from_s3(
+                    self.cfg,
+                    self.bucket,
+                    None,
+                    manifest_key,
+                    str(out_dir),
+                    prefer_system_tar=False,
+                    download_workers=1,
+                    extract_workers=1,
+                )
+
+        self.assertEqual((out_dir / "images/rule34:1.png").read_bytes(), b"img-1")
+        self.assertEqual((out_dir / "tags/rule34:1.txt").read_bytes(), b"tag-one\n")
+
+        self.assertTrue(
+            s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                manifest_key,
+                str(out_dir),
+                resume=True,
+                prefer_system_tar=False,
+                download_workers=1,
+                extract_workers=1,
+            )
+        )
+        self.assertEqual(
+            (out_dir / "manifest.jsonl").read_text(encoding="utf-8"),
+            '{"external_id":"rule34:1","image_path":"images/rule34:1.png","tags_path":"tags/rule34:1.txt"}\n',
+        )
+
+    def test_resume_rejects_existing_file_with_same_size_but_different_bytes(self):
+        manifest_key = "snapshots/interrupted_conflict/manifest.json"
+        chunk_key = "snapshots/interrupted_conflict/chunks/000000.tar"
+        _write_chunk_tar(
+            self._s3_object_path(chunk_key),
+            manifest_lines=['{"external_id":"rule34:1","image_path":"images/rule34:1.png"}'],
+            files={"images/rule34:1.png": b"good"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+        out_dir = self.root / "out_interrupted_conflict"
+        (out_dir / "images").mkdir(parents=True)
+        (out_dir / "images/rule34:1.png").write_bytes(b"evil")
+
+        with self.assertRaises(FileExistsError):
+            s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                manifest_key,
+                str(out_dir),
+                resume=True,
+                prefer_system_tar=False,
+                download_workers=1,
+                extract_workers=1,
+            )
+
     def test_rejects_absolute_chunk_paths_from_snapshot_manifest(self):
         manifest_key = "snapshots/abs/manifest.json"
         self._write_snapshot_manifest(manifest_key, ["/chunks/000000.tar"])

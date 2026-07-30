@@ -586,10 +586,28 @@ def _merge_staged_chunk(
                     raise FileExistsError(f"Conflict while merging: {dest_path}")
                 if os.path.getsize(dest_path) != os.path.getsize(src_path):
                     raise FileExistsError(f"Conflict while merging: {dest_path}")
+                if not _files_are_identical(src_path, dest_path):
+                    raise FileExistsError(f"Conflict while merging: {dest_path}")
+                # A process can stop after os.replace() moved this file but
+                # before the chunk state was committed. Treat only a
+                # byte-identical destination as the completed part of that
+                # interrupted merge.
+                continue
             raise FileExistsError(f"Conflict while merging: {dest_path}")
 
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         os.replace(src_path, dest_path)
+
+
+def _files_are_identical(left_path: str, right_path: str) -> bool:
+    with open(left_path, "rb") as left, open(right_path, "rb") as right:
+        while True:
+            left_block = left.read(4 * 1024 * 1024)
+            right_block = right.read(4 * 1024 * 1024)
+            if left_block != right_block:
+                return False
+            if not left_block:
+                return True
 
 
 def download_from_s3(
