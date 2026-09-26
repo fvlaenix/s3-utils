@@ -9,12 +9,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zipfile
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
-from threading import Lock
-from typing import Any, Callable, Dict, Optional
+from threading import Event, Lock
+from typing import Any, Callable, Dict, Optional, Union
 
 import boto3
 from botocore.client import Config as BotoConfig
@@ -54,6 +55,21 @@ class SnapshotTransferPhase(str, Enum):
     EXTRACTION = "extraction"
     ORDERED_MERGE = "ordered_merge"
     COMPLETED = "completed"
+
+
+class SnapshotMaterializationResult(str, Enum):
+    """Terminal result returned when snapshot cancellation is enabled."""
+
+    SUCCESS = "success"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+SnapshotCancellationSignal = Union[Event, Callable[[], bool]]
+
+
+class _SnapshotMaterializationCancelled(Exception):
+    """Private control-flow marker for cooperative snapshot cancellation."""
 
 
 @dataclass(frozen=True)
@@ -263,12 +279,19 @@ def _download_object(
     *,
     desc: Optional[str] = None,
     total_size: Optional[int] = None,
+    cancellation_requested: Optional[Callable[[], bool]] = None,
 ) -> bool:
     if total_size is None:
         total_size = _get_object_size(s3_client, bucket, key)
     progress = _ProgressBar(desc=desc or dest_path, total=total_size)
+
+    def _report_progress(bytes_amount: int) -> None:
+        progress(bytes_amount)
+        if cancellation_requested is not None and cancellation_requested():
+            raise _SnapshotMaterializationCancelled()
+
     try:
-        s3_client.download_file(bucket, key, dest_path, Callback=progress)
+        s3_client.download_file(bucket, key, dest_path, Callback=_report_progress)
         return True
     except (BotoCoreError, ClientError) as exc:
         print(f"[WARN] Failed to download s3://{bucket}/{key} -> {dest_path}: {exc}")
@@ -492,13 +515,19 @@ class _ChunkInspection:
     item_count: int
 
 
-def _inspect_chunk_tar(chunk_tar_path: str) -> _ChunkInspection:
+def _inspect_chunk_tar(
+    chunk_tar_path: str,
+    *,
+    cancellation_requested: Optional[Callable[[], bool]] = None,
+) -> _ChunkInspection:
     manifest_blob: Optional[bytes] = None
     file_paths: list[str] = []
     seen_paths: set[str] = set()
 
     with tarfile.open(chunk_tar_path, "r:*") as tar:
         for member in tar:
+            if cancellation_requested is not None and cancellation_requested():
+                raise _SnapshotMaterializationCancelled()
             if member.islnk() or member.issym():
                 raise ValueError(f"Symlink not allowed in tar: {member.name}")
 
@@ -538,9 +567,16 @@ def _inspect_chunk_tar(chunk_tar_path: str) -> _ChunkInspection:
     )
 
 
-def _extract_chunk_with_python_tar(chunk_tar_path: str, staging_dir: str) -> None:
+def _extract_chunk_with_python_tar(
+    chunk_tar_path: str,
+    staging_dir: str,
+    *,
+    cancellation_requested: Optional[Callable[[], bool]] = None,
+) -> None:
     with tarfile.open(chunk_tar_path, "r:*") as tar:
         for member in tar:
+            if cancellation_requested is not None and cancellation_requested():
+                raise _SnapshotMaterializationCancelled()
             normalized = _normalize_archive_path(member.name)
             if normalized == "manifest.jsonl" or member.isdir():
                 continue
@@ -561,7 +597,16 @@ def _extract_chunk_with_python_tar(chunk_tar_path: str, staging_dir: str) -> Non
             part_path = f"{dest_path}.part"
             try:
                 with open(part_path, "wb") as out:
-                    shutil.copyfileobj(extracted, out, length=4 * 1024 * 1024)
+                    while True:
+                        if (
+                            cancellation_requested is not None
+                            and cancellation_requested()
+                        ):
+                            raise _SnapshotMaterializationCancelled()
+                        block = extracted.read(4 * 1024 * 1024)
+                        if not block:
+                            break
+                        out.write(block)
                 os.replace(part_path, dest_path)
             finally:
                 if os.path.exists(part_path):
@@ -576,6 +621,7 @@ def _extract_chunk_with_system_tar(
     system_tar_path: str,
     chunk_tar_path: str,
     staging_dir: str,
+    cancellation_requested: Optional[Callable[[], bool]] = None,
 ) -> None:
     cmd = [
         system_tar_path,
@@ -588,15 +634,25 @@ def _extract_chunk_with_system_tar(
         "--no-same-permissions",
         "--delay-directory-restore",
     ]
-    completed = subprocess.run(
+    process = subprocess.Popen(
         cmd,
-        check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
     )
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
+    while process.poll() is None:
+        if cancellation_requested is not None and cancellation_requested():
+            # This is an owned direct child.  We wait for it to exit before
+            # returning cancellation, but do not claim to hard-kill an
+            # uncooperative third-party process.
+            process.terminate()
+            process.communicate()
+            raise _SnapshotMaterializationCancelled()
+        time.sleep(0.05)
+
+    _, stderr_output = process.communicate()
+    if process.returncode != 0:
+        stderr = (stderr_output or "").strip()
         if stderr:
             raise RuntimeError(f"tar extraction failed: {stderr}")
         raise RuntimeError("tar extraction failed")
@@ -608,11 +664,14 @@ def _merge_staged_chunk(
     local_dir: str,
     file_paths: list[str],
     verify_existing_files: bool,
+    cancellation_requested: Optional[Callable[[], bool]] = None,
 ) -> None:
     staging_abs = os.path.abspath(staging_dir)
     local_abs = os.path.abspath(local_dir)
 
     for rel_path in file_paths:
+        if cancellation_requested is not None and cancellation_requested():
+            raise _SnapshotMaterializationCancelled()
         src_path = os.path.abspath(os.path.join(staging_abs, rel_path))
         if os.path.commonpath([staging_abs, src_path]) != staging_abs:
             raise ValueError(f"Unsafe staged path: {rel_path}")
@@ -629,7 +688,11 @@ def _merge_staged_chunk(
                     raise FileExistsError(f"Conflict while merging: {dest_path}")
                 if os.path.getsize(dest_path) != os.path.getsize(src_path):
                     raise FileExistsError(f"Conflict while merging: {dest_path}")
-                if not _files_are_identical(src_path, dest_path):
+                if not _files_are_identical(
+                    src_path,
+                    dest_path,
+                    cancellation_requested=cancellation_requested,
+                ):
                     raise FileExistsError(f"Conflict while merging: {dest_path}")
                 # A process can stop after os.replace() moved this file but
                 # before the chunk state was committed. Treat only a
@@ -640,11 +703,20 @@ def _merge_staged_chunk(
 
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         os.replace(src_path, dest_path)
+        if cancellation_requested is not None and cancellation_requested():
+            raise _SnapshotMaterializationCancelled()
 
 
-def _files_are_identical(left_path: str, right_path: str) -> bool:
+def _files_are_identical(
+    left_path: str,
+    right_path: str,
+    *,
+    cancellation_requested: Optional[Callable[[], bool]] = None,
+) -> bool:
     with open(left_path, "rb") as left, open(right_path, "rb") as right:
         while True:
+            if cancellation_requested is not None and cancellation_requested():
+                raise _SnapshotMaterializationCancelled()
             left_block = left.read(4 * 1024 * 1024)
             right_block = right.read(4 * 1024 * 1024)
             if left_block != right_block:
@@ -713,7 +785,8 @@ def download_snapshot_from_s3(
     progress_callback: Optional[Callable[[SnapshotTransferProgress], None]] = None,
     operation_id: Optional[str] = None,
     attempt_id: Optional[str] = None,
-) -> bool:
+    cancellation_signal: Optional[SnapshotCancellationSignal] = None,
+) -> Union[bool, SnapshotMaterializationResult]:
     """
     Download snapshot chunks listed in manifest.json and merge them into local_dir.
 
@@ -725,7 +798,31 @@ def download_snapshot_from_s3(
     observation so an owning coordinator can bind it to its durable attempt.
     This loader does not interpret either identifier, create terminal status,
     or infer totals that the manifest and transfer callbacks do not expose.
+
+    ``cancellation_signal`` may be a :class:`threading.Event` or a no-argument
+    callable returning ``True`` when cancellation is requested.  With a signal,
+    this function returns :class:`SnapshotMaterializationResult` so cancellation
+    remains distinct from transfer failure.  Existing callers that omit it keep
+    the historical ``True``/``False`` result.
     """
+    def _cancellation_requested() -> bool:
+        if cancellation_signal is None:
+            return False
+        if callable(cancellation_signal):
+            return bool(cancellation_signal())
+        return cancellation_signal.is_set()
+
+    def _result(
+        outcome: SnapshotMaterializationResult,
+    ) -> Union[bool, SnapshotMaterializationResult]:
+        if cancellation_signal is None:
+            return outcome is SnapshotMaterializationResult.SUCCESS
+        return outcome
+
+    def _raise_if_cancelled() -> None:
+        if _cancellation_requested():
+            raise _SnapshotMaterializationCancelled()
+
     if not manifest_s3_path or manifest_s3_path.endswith("/"):
         raise ValueError("manifest_s3_path must be an object key, not a prefix")
 
@@ -743,6 +840,9 @@ def download_snapshot_from_s3(
     if extract_workers < 1:
         raise ValueError("extract_workers must be >= 1")
 
+    if _cancellation_requested():
+        return _result(SnapshotMaterializationResult.CANCELLED)
+
     if os.path.exists(local_dir) and os.listdir(local_dir) and not resume:
         raise ValueError(
             f"local_dir must be empty or non-existent when resume=False: {local_dir}"
@@ -758,6 +858,9 @@ def download_snapshot_from_s3(
 
     s3_client = create_s3_client(cfg, region)
 
+    if _cancellation_requested():
+        return _result(SnapshotMaterializationResult.CANCELLED)
+
     manifest_head = _head_object(s3_client, bucket, manifest_s3_path)
     manifest_size = manifest_head.get("ContentLength") if manifest_head else None
     manifest_etag = manifest_head.get("ETag") if manifest_head else None
@@ -765,6 +868,7 @@ def download_snapshot_from_s3(
     with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
         downloaded_manifest_path = tmp.name
     try:
+        _raise_if_cancelled()
         if not _download_object(
             s3_client,
             bucket,
@@ -772,10 +876,14 @@ def download_snapshot_from_s3(
             downloaded_manifest_path,
             desc="snapshot manifest",
             total_size=manifest_size,
+            cancellation_requested=_cancellation_requested,
         ):
-            return False
+            return _result(SnapshotMaterializationResult.FAILED)
+        _raise_if_cancelled()
         with open(downloaded_manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
+    except _SnapshotMaterializationCancelled:
+        return _result(SnapshotMaterializationResult.CANCELLED)
     finally:
         try:
             os.remove(downloaded_manifest_path)
@@ -888,6 +996,8 @@ def download_snapshot_from_s3(
 
     chunk_plans: list[_ChunkPlan] = []
     for index, chunk_path in enumerate(chunk_paths):
+        if _cancellation_requested():
+            return _result(SnapshotMaterializationResult.CANCELLED)
         chunk_key = posixpath.join(prefix, chunk_path) if prefix else chunk_path
         chunk_suffix = os.path.splitext(posixpath.basename(chunk_path))[1] or ".tar"
         chunk_cache_path = os.path.join(
@@ -1083,6 +1193,7 @@ def download_snapshot_from_s3(
     progress.emit(SnapshotTransferPhase.CHUNK_TRANSFER)
 
     def _ensure_chunk_cache(plan: _ChunkPlan) -> None:
+        _raise_if_cancelled()
         cache_is_valid = False
         if os.path.exists(plan.cache_path) and os.path.isfile(plan.cache_path):
             cache_is_valid = True
@@ -1094,13 +1205,20 @@ def download_snapshot_from_s3(
             return
 
         chunk_tmp_path = f"{plan.cache_path}.download"
+
+        def _record_network_bytes(bytes_amount: int) -> None:
+            progress.record_network_bytes(bytes_amount)
+            _raise_if_cancelled()
+
         try:
+            _raise_if_cancelled()
             s3_client.download_file(
                 bucket,
                 plan.chunk_key,
                 chunk_tmp_path,
-                Callback=progress.record_network_bytes,
+                Callback=_record_network_bytes,
             )
+            _raise_if_cancelled()
             os.replace(chunk_tmp_path, plan.cache_path)
         finally:
             if os.path.exists(chunk_tmp_path):
@@ -1114,25 +1232,61 @@ def download_snapshot_from_s3(
         progress.record_verified_chunk(plan.index, os.path.getsize(plan.cache_path))
 
     download_progress = tqdm(total=len(chunks_to_download), unit="chunk", desc="chunk cache")
+    download_cancelled = False
+    download_error: Optional[str] = None
     try:
         if chunks_to_download:
             with ThreadPoolExecutor(max_workers=download_workers) as download_pool:
-                future_map = {
-                    download_pool.submit(_ensure_chunk_cache, plan): plan.index
-                    for plan in chunks_to_download
-                }
-                for future in as_completed(future_map):
-                    index = future_map[future]
+                future_map: Dict[Future[None], int] = {}
+                next_download_plan = 0
+
+                def _fill_download_queue() -> None:
+                    nonlocal next_download_plan
+                    while (
+                        next_download_plan < len(chunks_to_download)
+                        and len(future_map) < prefetch_chunks
+                        and not _cancellation_requested()
+                    ):
+                        plan = chunks_to_download[next_download_plan]
+                        next_download_plan += 1
+                        future_map[download_pool.submit(_ensure_chunk_cache, plan)] = plan.index
+
+                _fill_download_queue()
+                while future_map:
+                    if _cancellation_requested():
+                        download_cancelled = True
+                        for pending in future_map:
+                            pending.cancel()
+
+                    future = next(as_completed(future_map))
+                    index = future_map.pop(future)
                     try:
                         future.result()
+                    except _SnapshotMaterializationCancelled:
+                        download_cancelled = True
+                    except CancelledError:
+                        download_cancelled = True
                     except Exception as exc:
-                        print(
-                            f"[WARN] Snapshot download failed: failed to cache chunk {index + 1}/{len(chunk_paths)}: {exc}"
+                        download_error = (
+                            "failed to cache chunk "
+                            f"{index + 1}/{len(chunk_paths)}: {exc}"
                         )
-                        return False
-                    download_progress.update(1)
+                    else:
+                        download_progress.update(1)
+
+                    if download_cancelled or download_error is not None:
+                        for pending in future_map:
+                            pending.cancel()
+                    else:
+                        _fill_download_queue()
     finally:
         download_progress.close()
+
+    if download_cancelled or _cancellation_requested():
+        return _result(SnapshotMaterializationResult.CANCELLED)
+    if download_error is not None:
+        print(f"[WARN] Snapshot download failed: {download_error}")
+        return _result(SnapshotMaterializationResult.FAILED)
 
     system_tar_path: Optional[str] = None
     use_system_tar = False
@@ -1158,7 +1312,12 @@ def download_snapshot_from_s3(
 
     def _prepare_chunk(plan: _ChunkPlan) -> _PreparedChunk:
         nonlocal fallback_warned
-        inspection = _inspect_chunk_tar(plan.cache_path)
+        _raise_if_cancelled()
+        inspection = _inspect_chunk_tar(
+            plan.cache_path,
+            cancellation_requested=_cancellation_requested,
+        )
+        _raise_if_cancelled()
         staging_dir = os.path.join(staging_root, f"{plan.index:06d}")
 
         if os.path.exists(staging_dir):
@@ -1166,25 +1325,38 @@ def download_snapshot_from_s3(
         os.makedirs(staging_dir, exist_ok=True)
 
         try:
+            _raise_if_cancelled()
             if use_system_tar and system_tar_path is not None:
                 try:
                     _extract_chunk_with_system_tar(
                         system_tar_path=system_tar_path,
                         chunk_tar_path=plan.cache_path,
                         staging_dir=staging_dir,
+                        cancellation_requested=_cancellation_requested,
                     )
+                except _SnapshotMaterializationCancelled:
+                    raise
                 except Exception:
                     with fallback_warn_lock:
                         if not fallback_warned:
                             print(
                                 "[WARN] Fast extraction via system tar failed; falling back to Python tarfile extraction."
-                            )
+                        )
                             fallback_warned = True
                     shutil.rmtree(staging_dir, ignore_errors=True)
                     os.makedirs(staging_dir, exist_ok=True)
-                    _extract_chunk_with_python_tar(plan.cache_path, staging_dir)
+                    _extract_chunk_with_python_tar(
+                        plan.cache_path,
+                        staging_dir,
+                        cancellation_requested=_cancellation_requested,
+                    )
             else:
-                _extract_chunk_with_python_tar(plan.cache_path, staging_dir)
+                _extract_chunk_with_python_tar(
+                    plan.cache_path,
+                    staging_dir,
+                    cancellation_requested=_cancellation_requested,
+                )
+            _raise_if_cancelled()
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
@@ -1208,7 +1380,11 @@ def download_snapshot_from_s3(
 
     def _fill_pending(extract_pool: ThreadPoolExecutor) -> None:
         nonlocal next_plan_to_submit
-        while next_plan_to_submit < len(chunk_plans) and len(pending_futures) < max_pending_prepared:
+        while (
+            next_plan_to_submit < len(chunk_plans)
+            and len(pending_futures) < max_pending_prepared
+            and not _cancellation_requested()
+        ):
             plan = chunk_plans[next_plan_to_submit]
             next_plan_to_submit += 1
             if plan.skip_processing:
@@ -1216,6 +1392,7 @@ def download_snapshot_from_s3(
             pending_futures[plan.index] = extract_pool.submit(_prepare_chunk, plan)
 
     stream_error: Optional[str] = None
+    stream_cancelled = False
     chunk_progress = tqdm(total=len(chunk_paths), unit="chunk", desc="chunks")
     try:
         with ThreadPoolExecutor(max_workers=extract_workers) as extract_pool:
@@ -1224,6 +1401,9 @@ def download_snapshot_from_s3(
             progress.emit(SnapshotTransferPhase.ORDERED_MERGE)
             with open(merged_manifest_path, "ab") as merged_manifest:
                 for plan in chunk_plans:
+                    if _cancellation_requested():
+                        stream_cancelled = True
+                        break
                     if plan.skip_processing:
                         chunk_progress.update(1)
                         _fill_pending(extract_pool)
@@ -1240,6 +1420,12 @@ def download_snapshot_from_s3(
                             prepared.index,
                             prepared.item_count,
                         )
+                    except _SnapshotMaterializationCancelled:
+                        stream_cancelled = True
+                        break
+                    except CancelledError:
+                        stream_cancelled = True
+                        break
                     except Exception as exc:
                         stream_error = (
                             f"Failed to extract chunk {plan.index + 1}/{len(chunk_paths)}: {exc}"
@@ -1251,11 +1437,17 @@ def download_snapshot_from_s3(
                             staging_dir=prepared.staging_dir,
                             local_dir=local_dir,
                             file_paths=prepared.file_paths,
-                            verify_existing_files=verify_existing_files,
-                        )
+                        verify_existing_files=verify_existing_files,
+                        cancellation_requested=_cancellation_requested,
+                    )
+                        _raise_if_cancelled()
                         merged_manifest.write(prepared.manifest_blob)
                         merged_manifest.flush()
                         os.fsync(merged_manifest.fileno())
+                        _raise_if_cancelled()
+                    except _SnapshotMaterializationCancelled:
+                        stream_cancelled = True
+                        break
                     finally:
                         shutil.rmtree(prepared.staging_dir, ignore_errors=True)
 
@@ -1274,7 +1466,7 @@ def download_snapshot_from_s3(
                     chunk_progress.update(1)
                     _fill_pending(extract_pool)
 
-            if stream_error is not None:
+            if stream_error is not None or stream_cancelled:
                 for future in pending_futures.values():
                     future.cancel()
     finally:
@@ -1283,7 +1475,10 @@ def download_snapshot_from_s3(
 
     if stream_error is not None:
         print(f"[WARN] Snapshot download failed: {stream_error}")
-        return False
+        return _result(SnapshotMaterializationResult.FAILED)
+
+    if stream_cancelled or _cancellation_requested():
+        return _result(SnapshotMaterializationResult.CANCELLED)
 
     progress.record_completed()
-    return True
+    return _result(SnapshotMaterializationResult.SUCCESS)

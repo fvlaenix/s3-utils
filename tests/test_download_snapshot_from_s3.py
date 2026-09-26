@@ -11,6 +11,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from typing import Callable
 from unittest import mock
 
 
@@ -100,6 +101,8 @@ class _FakeS3Client:
         self.download_calls: list[tuple[str, str, str]] = []
         self.callback_parts_by_key: dict[str, list[int]] = {}
         self.callback_barrier_by_key: dict[str, threading.Barrier] = {}
+        self.after_callback_by_key: dict[str, Callable[[int], None]] = {}
+        self.download_gate_by_key: dict[str, tuple[threading.Event, threading.Event]] = {}
 
     def _object_path(self, bucket: str, key: str) -> Path:
         return self._s3_root / bucket / key
@@ -117,6 +120,13 @@ class _FakeS3Client:
         if not src.exists():
             raise FileNotFoundError(f"Missing object: s3://{bucket}/{key}")
 
+        gate = self.download_gate_by_key.get(key)
+        if gate is not None:
+            started, release = gate
+            started.set()
+            if not release.wait(timeout=2):
+                raise TimeoutError(f"Timed out waiting to release fake download: {key}")
+
         os_dest = Path(dest_path)
         os_dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, os_dest)
@@ -133,6 +143,9 @@ class _FakeS3Client:
                 [src.stat().st_size],
             ):
                 Callback(byte_count)
+                callback_hook = self.after_callback_by_key.get(key)
+                if callback_hook is not None:
+                    callback_hook(byte_count)
 
 
 def _write_chunk_tar(path: Path, *, manifest_lines: list[str] | None, files: dict[str, bytes]) -> None:
@@ -406,6 +419,328 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
         self.assertEqual(
             events[-1].verified_bytes,
             self._s3_object_path(chunk_key).stat().st_size,
+        )
+
+    def test_cancellation_during_transfer_quiesces_workers_and_resume_is_complete(self):
+        manifest_key = "snapshots/cancel_transfer/manifest.json"
+        first_key = "snapshots/cancel_transfer/chunks/000000.tar"
+        second_key = "snapshots/cancel_transfer/chunks/000001.tar"
+        for index, key in enumerate((first_key, second_key), start=1):
+            _write_chunk_tar(
+                self._s3_object_path(key),
+                manifest_lines=[
+                    f'{{"external_id":"rule34:{index}","image_path":"images/rule34:{index}.png"}}'
+                ],
+                files={f"images/rule34:{index}.png": f"img-{index}".encode()},
+            )
+        self._write_snapshot_manifest(
+            manifest_key,
+            ["chunks/000000.tar", "chunks/000001.tar"],
+        )
+
+        cancelled = threading.Event()
+        first_chunk_size = self._s3_object_path(first_key).stat().st_size
+        self.client.callback_parts_by_key[first_key] = [1, first_chunk_size - 1]
+        callback_count = 0
+
+        def cancel_after_first_callback(_byte_count: int) -> None:
+            nonlocal callback_count
+            callback_count += 1
+            if callback_count == 1:
+                cancelled.set()
+
+        self.client.after_callback_by_key[first_key] = cancel_after_first_callback
+        out_dir = self.root / "out_cancel_transfer"
+        result = s3.download_snapshot_from_s3(
+            self.cfg,
+            self.bucket,
+            None,
+            manifest_key,
+            str(out_dir),
+            prefer_system_tar=False,
+            download_workers=1,
+            prefetch_chunks=1,
+            extract_workers=1,
+            cancellation_signal=cancelled,
+        )
+
+        self.assertEqual(result, s3.SnapshotMaterializationResult.CANCELLED)
+        self.assertEqual(callback_count, 1, "transfer must stop at the next callback")
+        transferred_keys = [key for _, key, _ in self.client.download_calls]
+        self.assertNotIn(second_key, transferred_keys)
+        self.assertFalse((out_dir / ".snapshot_cache/chunks/000000.tar").exists())
+        self.assertFalse(
+            (out_dir / ".snapshot_cache/chunks/000000.tar.download").exists()
+        )
+
+        self.assertTrue(
+            s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                manifest_key,
+                str(out_dir),
+                prefer_system_tar=False,
+                download_workers=1,
+                extract_workers=1,
+            )
+        )
+        self.assertEqual(
+            (out_dir / "manifest.jsonl").read_text(encoding="utf-8").splitlines(),
+            [
+                '{"external_id":"rule34:1","image_path":"images/rule34:1.png"}',
+                '{"external_id":"rule34:2","image_path":"images/rule34:2.png"}',
+            ],
+        )
+
+    def test_cancellation_signal_distinguishes_success_from_failure(self):
+        cancellation_signal = threading.Event()
+        success_manifest_key = "snapshots/cancel_result_success/manifest.json"
+        success_chunk_key = "snapshots/cancel_result_success/chunks/000000.tar"
+        _write_chunk_tar(
+            self._s3_object_path(success_chunk_key),
+            manifest_lines=['{"external_id":"rule34:1","image_path":"images/rule34:1.png"}'],
+            files={"images/rule34:1.png": b"img-1"},
+        )
+        self._write_snapshot_manifest(success_manifest_key, ["chunks/000000.tar"])
+
+        self.assertEqual(
+            s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                success_manifest_key,
+                str(self.root / "out_cancel_result_success"),
+                prefer_system_tar=False,
+                download_workers=1,
+                extract_workers=1,
+                cancellation_signal=cancellation_signal,
+            ),
+            s3.SnapshotMaterializationResult.SUCCESS,
+        )
+
+        failure_manifest_key = "snapshots/cancel_result_failure/manifest.json"
+        _write_chunk_tar(
+            self._s3_object_path("snapshots/cancel_result_failure/chunks/000000.tar"),
+            manifest_lines=None,
+            files={"images/rule34:2.png": b"img-2"},
+        )
+        self._write_snapshot_manifest(failure_manifest_key, ["chunks/000000.tar"])
+        self.assertEqual(
+            s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                failure_manifest_key,
+                str(self.root / "out_cancel_result_failure"),
+                prefer_system_tar=False,
+                download_workers=1,
+                extract_workers=1,
+                cancellation_signal=cancellation_signal,
+            ),
+            s3.SnapshotMaterializationResult.FAILED,
+        )
+
+    def test_cancellation_after_extraction_does_not_publish_chunk_and_resumes(self):
+        manifest_key = "snapshots/cancel_extraction/manifest.json"
+        chunk_key = "snapshots/cancel_extraction/chunks/000000.tar"
+        _write_chunk_tar(
+            self._s3_object_path(chunk_key),
+            manifest_lines=['{"external_id":"rule34:1","image_path":"images/rule34:1.png"}'],
+            files={"images/rule34:1.png": b"img-1"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+        cancelled = threading.Event()
+        out_dir = self.root / "out_cancel_extraction"
+        real_extract = s3._extract_chunk_with_python_tar
+        extraction_calls = 0
+
+        def cancel_after_extraction(*args, **kwargs):
+            nonlocal extraction_calls
+            extraction_calls += 1
+            result = real_extract(*args, **kwargs)
+            cancelled.set()
+            return result
+
+        with mock.patch.object(
+            s3,
+            "_extract_chunk_with_python_tar",
+            side_effect=cancel_after_extraction,
+        ):
+            result = s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                manifest_key,
+                str(out_dir),
+                prefer_system_tar=False,
+                download_workers=1,
+                extract_workers=1,
+                cancellation_signal=cancelled,
+            )
+
+        self.assertEqual(result, s3.SnapshotMaterializationResult.CANCELLED)
+        self.assertEqual(extraction_calls, 1)
+        self.assertFalse((out_dir / "images/rule34:1.png").exists())
+        self.assertFalse((out_dir / "manifest.jsonl").read_text(encoding="utf-8"))
+
+        self.assertTrue(
+            s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                manifest_key,
+                str(out_dir),
+                prefer_system_tar=False,
+                download_workers=1,
+                extract_workers=1,
+            )
+        )
+        self.assertEqual(
+            (out_dir / "manifest.jsonl").read_text(encoding="utf-8"),
+            '{"external_id":"rule34:1","image_path":"images/rule34:1.png"}\n',
+        )
+
+    def test_system_tar_cancellation_terminates_and_waits_for_owned_process(self):
+        class RunningTar:
+            def __init__(self):
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def communicate(self):
+                self.returncode = -15
+                return "", ""
+
+        tar_process = RunningTar()
+        cancellation_checks = 0
+
+        def cancellation_requested():
+            nonlocal cancellation_checks
+            cancellation_checks += 1
+            return cancellation_checks >= 2
+
+        with mock.patch.object(s3.subprocess, "Popen", return_value=tar_process), mock.patch.object(
+            s3.time,
+            "sleep",
+        ):
+            with self.assertRaises(s3._SnapshotMaterializationCancelled):
+                s3._extract_chunk_with_system_tar(
+                    system_tar_path="/fake/tar",
+                    chunk_tar_path="/fake/chunk.tar",
+                    staging_dir="/fake/staging",
+                    cancellation_requested=cancellation_requested,
+                )
+
+        self.assertTrue(tar_process.terminated)
+        self.assertGreaterEqual(cancellation_checks, 2)
+
+    def test_default_system_tar_path_reports_cancellation_without_fallback(self):
+        manifest_key = "snapshots/cancel_system_tar/manifest.json"
+        chunk_key = "snapshots/cancel_system_tar/chunks/000000.tar"
+        _write_chunk_tar(
+            self._s3_object_path(chunk_key),
+            manifest_lines=['{"external_id":"rule34:1","image_path":"images/rule34:1.png"}'],
+            files={"images/rule34:1.png": b"img-1"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+        cancelled = threading.Event()
+        out_dir = self.root / "out_cancel_system_tar"
+
+        def cancel_system_tar(**_kwargs):
+            cancelled.set()
+            raise s3._SnapshotMaterializationCancelled()
+
+        with mock.patch.object(s3.sys, "platform", "linux"), mock.patch.object(
+            s3.shutil,
+            "which",
+            return_value="/fake/tar",
+        ), mock.patch.object(
+            s3,
+            "_extract_chunk_with_system_tar",
+            side_effect=cancel_system_tar,
+        ) as extract:
+            result = s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                manifest_key,
+                str(out_dir),
+                download_workers=1,
+                extract_workers=1,
+                cancellation_signal=cancelled,
+            )
+
+        self.assertEqual(result, s3.SnapshotMaterializationResult.CANCELLED)
+        self.assertEqual(extract.call_count, 1)
+        self.assertFalse((out_dir / "images/rule34:1.png").exists())
+        self.assertEqual((out_dir / "manifest.jsonl").read_text(encoding="utf-8"), "")
+
+    def test_cancellation_during_merge_recovers_without_duplicate_manifest_rows(self):
+        manifest_key = "snapshots/cancel_merge/manifest.json"
+        chunk_key = "snapshots/cancel_merge/chunks/000000.tar"
+        _write_chunk_tar(
+            self._s3_object_path(chunk_key),
+            manifest_lines=[
+                '{"external_id":"rule34:1","image_path":"images/rule34:1.png","tags_path":"tags/rule34:1.txt"}'
+            ],
+            files={
+                "images/rule34:1.png": b"img-1",
+                "tags/rule34:1.txt": b"tag-one\n",
+            },
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+        cancelled = threading.Event()
+        out_dir = self.root / "out_cancel_merge"
+        first_dest = out_dir / "images/rule34:1.png"
+        real_replace = s3.os.replace
+
+        def replace_then_cancel(src, dest):
+            result = real_replace(src, dest)
+            if Path(dest) == first_dest:
+                cancelled.set()
+            return result
+
+        with mock.patch.object(s3.os, "replace", side_effect=replace_then_cancel):
+            result = s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                manifest_key,
+                str(out_dir),
+                prefer_system_tar=False,
+                download_workers=1,
+                extract_workers=1,
+                cancellation_signal=cancelled,
+            )
+
+        self.assertEqual(result, s3.SnapshotMaterializationResult.CANCELLED)
+        self.assertEqual(first_dest.read_bytes(), b"img-1")
+        self.assertFalse((out_dir / "tags/rule34:1.txt").exists())
+        self.assertEqual((out_dir / "manifest.jsonl").read_text(encoding="utf-8"), "")
+
+        self.assertTrue(
+            s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                manifest_key,
+                str(out_dir),
+                prefer_system_tar=False,
+                download_workers=1,
+                extract_workers=1,
+            )
+        )
+        self.assertEqual(
+            (out_dir / "manifest.jsonl").read_text(encoding="utf-8").splitlines(),
+            [
+                '{"external_id":"rule34:1","image_path":"images/rule34:1.png","tags_path":"tags/rule34:1.txt"}'
+            ],
         )
 
     def test_returns_false_when_chunk_has_no_manifest_jsonl(self):
