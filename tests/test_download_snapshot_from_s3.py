@@ -7,6 +7,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -97,6 +98,8 @@ class _FakeS3Client:
         self._s3_root = s3_root
         self._lock = threading.Lock()
         self.download_calls: list[tuple[str, str, str]] = []
+        self.callback_parts_by_key: dict[str, list[int]] = {}
+        self.callback_barrier_by_key: dict[str, threading.Barrier] = {}
 
     def _object_path(self, bucket: str, key: str) -> Path:
         return self._s3_root / bucket / key
@@ -122,7 +125,14 @@ class _FakeS3Client:
             self.download_calls.append((bucket, key, dest_path))
 
         if Callback is not None:
-            Callback(src.stat().st_size)
+            barrier = self.callback_barrier_by_key.get(key)
+            if barrier is not None:
+                barrier.wait(timeout=2)
+            for byte_count in self.callback_parts_by_key.get(
+                key,
+                [src.stat().st_size],
+            ):
+                Callback(byte_count)
 
 
 def _write_chunk_tar(path: Path, *, manifest_lines: list[str] | None, files: dict[str, bytes]) -> None:
@@ -226,6 +236,178 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
             ),
         )
 
+    def test_progress_reports_typed_phases_retry_bytes_and_pre_completion_state(self):
+        manifest_key = "snapshots/progress/manifest.json"
+        chunk_key = "snapshots/progress/chunks/000000.tar"
+        _write_chunk_tar(
+            self._s3_object_path(chunk_key),
+            manifest_lines=['{"external_id":"rule34:1","image_path":"images/rule34:1.png"}'],
+            files={"images/rule34:1.png": b"img-1"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+        chunk_size = self._s3_object_path(chunk_key).stat().st_size
+        # boto callbacks are deltas. Repeating a delta models retried network
+        # traffic without allowing verified snapshot progress to double count.
+        self.client.callback_parts_by_key[chunk_key] = [chunk_size, chunk_size]
+
+        events: list[s3.SnapshotTransferProgress] = []
+        result = s3.download_snapshot_from_s3(
+            self.cfg,
+            self.bucket,
+            None,
+            manifest_key,
+            str(self.root / "out_progress"),
+            prefer_system_tar=False,
+            download_workers=1,
+            extract_workers=1,
+            operation_id="operation-479",
+            attempt_id="attempt-1",
+            progress_callback=events.append,
+        )
+
+        self.assertTrue(result)
+        self.assertTrue(
+            {
+                s3.SnapshotTransferPhase.MANIFEST_READ,
+                s3.SnapshotTransferPhase.CHUNK_TRANSFER,
+                s3.SnapshotTransferPhase.EXTRACTION,
+                s3.SnapshotTransferPhase.ORDERED_MERGE,
+                s3.SnapshotTransferPhase.COMPLETED,
+            }.issubset({event.phase for event in events})
+        )
+        self.assertEqual(events[-1].phase, s3.SnapshotTransferPhase.COMPLETED)
+        self.assertEqual(events[-1].operation_id, "operation-479")
+        self.assertEqual(events[-1].attempt_id, "attempt-1")
+        self.assertEqual(events[-1].network_bytes, chunk_size * 2)
+        self.assertEqual(events[-1].verified_bytes, chunk_size)
+        self.assertEqual(events[-1].total_bytes, chunk_size)
+        self.assertEqual(events[-1].completed_chunks, 1)
+        self.assertEqual(events[-1].total_chunks, 1)
+        self.assertEqual(events[-1].completed_items, 1)
+        self.assertEqual(events[-1].total_items, 1)
+        self.assertTrue(
+            any(
+                event.phase == s3.SnapshotTransferPhase.CHUNK_TRANSFER
+                and event.network_bytes > 0
+                and event.completed_chunks == 0
+                for event in events
+            ),
+            "transfer progress must be observable before terminal completion",
+        )
+        for event in events:
+            self.assertLessEqual(event.completed_chunks, event.total_chunks)
+            if event.verified_bytes is not None and event.total_bytes is not None:
+                self.assertLessEqual(event.verified_bytes, event.total_bytes)
+            if event.total_items is not None:
+                self.assertLessEqual(event.completed_items, event.total_items)
+
+    def test_progress_callbacks_are_serialized_and_monotone_for_concurrent_chunks(self):
+        manifest_key = "snapshots/concurrent_progress/manifest.json"
+        chunk_keys = [
+            "snapshots/concurrent_progress/chunks/000000.tar",
+            "snapshots/concurrent_progress/chunks/000001.tar",
+        ]
+        for index, chunk_key in enumerate(chunk_keys, start=1):
+            _write_chunk_tar(
+                self._s3_object_path(chunk_key),
+                manifest_lines=[
+                    f'{{"external_id":"rule34:{index}","image_path":"images/rule34:{index}.png"}}'
+                ],
+                files={f"images/rule34:{index}.png": f"img-{index}".encode()},
+            )
+        self._write_snapshot_manifest(
+            manifest_key,
+            ["chunks/000000.tar", "chunks/000001.tar"],
+        )
+        barrier = threading.Barrier(2)
+        for chunk_key in chunk_keys:
+            self.client.callback_barrier_by_key[chunk_key] = barrier
+
+        events: list[s3.SnapshotTransferProgress] = []
+        callback_lock = threading.Lock()
+        active_callbacks = 0
+        max_active_callbacks = 0
+
+        def capture(event: s3.SnapshotTransferProgress) -> None:
+            nonlocal active_callbacks, max_active_callbacks
+            with callback_lock:
+                active_callbacks += 1
+                max_active_callbacks = max(max_active_callbacks, active_callbacks)
+            try:
+                time.sleep(0.01)
+                events.append(event)
+            finally:
+                with callback_lock:
+                    active_callbacks -= 1
+
+        self.assertTrue(
+            s3.download_snapshot_from_s3(
+                self.cfg,
+                self.bucket,
+                None,
+                manifest_key,
+                str(self.root / "out_concurrent_progress"),
+                prefer_system_tar=False,
+                download_workers=2,
+                extract_workers=2,
+                progress_callback=capture,
+            )
+        )
+
+        self.assertEqual(max_active_callbacks, 1)
+        self.assertGreaterEqual(len(events), 2)
+        self.assertEqual(events[-1].phase, s3.SnapshotTransferPhase.COMPLETED)
+        for previous, current in zip(events, events[1:]):
+            self.assertLessEqual(previous.network_bytes, current.network_bytes)
+            self.assertLessEqual(previous.completed_chunks, current.completed_chunks)
+            self.assertLessEqual(previous.completed_items, current.completed_items)
+            if previous.verified_bytes is not None and current.verified_bytes is not None:
+                self.assertLessEqual(previous.verified_bytes, current.verified_bytes)
+            self.assertEqual(previous.total_chunks, current.total_chunks)
+            if previous.total_bytes is not None and current.total_bytes is not None:
+                self.assertEqual(previous.total_bytes, current.total_bytes)
+            if previous.total_items is not None and current.total_items is not None:
+                self.assertEqual(previous.total_items, current.total_items)
+
+    def test_progress_keeps_byte_total_unknown_when_chunk_heads_are_unavailable(self):
+        manifest_key = "snapshots/unknown_total/manifest.json"
+        chunk_key = "snapshots/unknown_total/chunks/000000.tar"
+        _write_chunk_tar(
+            self._s3_object_path(chunk_key),
+            manifest_lines=['{"external_id":"rule34:1","image_path":"images/rule34:1.png"}'],
+            files={"images/rule34:1.png": b"img-1"},
+        )
+        self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
+        real_head_object = s3._head_object
+
+        def head_without_chunk_size(client, bucket, key):
+            if key == chunk_key:
+                return None
+            return real_head_object(client, bucket, key)
+
+        events: list[s3.SnapshotTransferProgress] = []
+        with mock.patch.object(s3, "_head_object", side_effect=head_without_chunk_size):
+            self.assertTrue(
+                s3.download_snapshot_from_s3(
+                    self.cfg,
+                    self.bucket,
+                    None,
+                    manifest_key,
+                    str(self.root / "out_unknown_total"),
+                    prefer_system_tar=False,
+                    download_workers=1,
+                    extract_workers=1,
+                    progress_callback=events.append,
+                )
+            )
+
+        self.assertTrue(events)
+        self.assertTrue(all(event.total_bytes is None for event in events))
+        self.assertEqual(
+            events[-1].verified_bytes,
+            self._s3_object_path(chunk_key).stat().st_size,
+        )
+
     def test_returns_false_when_chunk_has_no_manifest_jsonl(self):
         manifest_key = "snapshots/missing_manifest/manifest.json"
         _write_chunk_tar(
@@ -236,6 +418,7 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
         self._write_snapshot_manifest(manifest_key, ["chunks/000000.tar"])
 
         out_dir = self.root / "out_missing_manifest"
+        events: list[s3.SnapshotTransferProgress] = []
         result = s3.download_snapshot_from_s3(
             self.cfg,
             self.bucket,
@@ -245,8 +428,15 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
             prefer_system_tar=False,
             download_workers=1,
             extract_workers=1,
+            progress_callback=events.append,
         )
         self.assertFalse(result)
+        self.assertNotIn(
+            s3.SnapshotTransferPhase.COMPLETED,
+            [event.phase for event in events],
+        )
+        self.assertTrue(events)
+        self.assertTrue(all(event.completed_chunks == 0 for event in events))
 
     def test_fails_hard_on_cross_chunk_path_conflict(self):
         manifest_key = "snapshots/conflict/manifest.json"
@@ -303,6 +493,7 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
         self.assertTrue(first)
         merged_once = (out_dir / "manifest.jsonl").read_text(encoding="utf-8")
 
+        resume_events: list[s3.SnapshotTransferProgress] = []
         second = s3.download_snapshot_from_s3(
             self.cfg,
             self.bucket,
@@ -313,6 +504,7 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
             prefer_system_tar=False,
             download_workers=1,
             extract_workers=1,
+            progress_callback=resume_events.append,
         )
         self.assertTrue(second)
         merged_twice = (out_dir / "manifest.jsonl").read_text(encoding="utf-8")
@@ -320,6 +512,14 @@ class DownloadSnapshotFromS3Tests(unittest.TestCase):
 
         chunk_downloads = [key for _, key, _ in self.client.download_calls if key == chunk_key]
         self.assertEqual(len(chunk_downloads), 1)
+        self.assertEqual(resume_events[-1].phase, s3.SnapshotTransferPhase.COMPLETED)
+        self.assertTrue(all(event.network_bytes == 0 for event in resume_events))
+        self.assertEqual(resume_events[-1].completed_chunks, 1)
+        self.assertEqual(resume_events[-1].completed_items, 1)
+        self.assertEqual(
+            resume_events[-1].verified_bytes,
+            self._s3_object_path(chunk_key).stat().st_size,
+        )
 
     def test_resume_after_merge_before_state_commit_reuses_identical_files(self):
         manifest_key = "snapshots/interrupted_merge/manifest.json"

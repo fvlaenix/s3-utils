@@ -12,8 +12,9 @@ import tempfile
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from enum import Enum
 from threading import Lock
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import boto3
 from botocore.client import Config as BotoConfig
@@ -43,6 +44,43 @@ class S3Config:
     access_key: Optional[str] = None
     secret_key: Optional[str] = None
     session_token: Optional[str] = None
+
+
+class SnapshotTransferPhase(str, Enum):
+    """Source-owned stages emitted by :func:`download_snapshot_from_s3`."""
+
+    MANIFEST_READ = "manifest_read"
+    CHUNK_TRANSFER = "chunk_transfer"
+    EXTRACTION = "extraction"
+    ORDERED_MERGE = "ordered_merge"
+    COMPLETED = "completed"
+
+
+@dataclass(frozen=True)
+class SnapshotTransferProgress:
+    """One immutable snapshot-materialization observation.
+
+    ``network_bytes`` counts every byte quantity received from boto's chunk
+    transfer callbacks, including a retry of a previously received range.
+    ``verified_bytes`` counts a successfully validated cache file only once
+    per chunk.  It is ``None`` when resumed state lacks the size of an already
+    completed chunk, rather than inventing a partial total.
+
+    Item counters count validated ``manifest.jsonl`` records.  They are
+    independent from the terminal ``COMPLETED`` phase: callers must continue
+    to use the loader result for success or failure authority.
+    """
+
+    phase: SnapshotTransferPhase
+    operation_id: Optional[str]
+    attempt_id: Optional[str]
+    network_bytes: int
+    verified_bytes: Optional[int]
+    total_bytes: Optional[int]
+    completed_chunks: int
+    total_chunks: int
+    completed_items: int
+    total_items: Optional[int]
 
 
 def _parse_properties(path: str) -> Dict[str, str]:
@@ -451,6 +489,7 @@ def _ensure_manifest_offset(path: str, expected_size: int) -> None:
 class _ChunkInspection:
     manifest_blob: bytes
     file_paths: list[str]
+    item_count: int
 
 
 def _inspect_chunk_tar(chunk_tar_path: str) -> _ChunkInspection:
@@ -492,7 +531,11 @@ def _inspect_chunk_tar(chunk_tar_path: str) -> _ChunkInspection:
         file_paths=file_paths,
     )
 
-    return _ChunkInspection(manifest_blob=manifest_blob, file_paths=file_paths)
+    return _ChunkInspection(
+        manifest_blob=manifest_blob,
+        file_paths=file_paths,
+        item_count=len(manifest_blob.splitlines()),
+    )
 
 
 def _extract_chunk_with_python_tar(chunk_tar_path: str, staging_dir: str) -> None:
@@ -667,12 +710,21 @@ def download_snapshot_from_s3(
     download_workers: Optional[int] = None,
     extract_workers: Optional[int] = None,
     prefer_system_tar: bool = True,
+    progress_callback: Optional[Callable[[SnapshotTransferProgress], None]] = None,
+    operation_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
 ) -> bool:
     """
     Download snapshot chunks listed in manifest.json and merge them into local_dir.
 
     The output contains a merged manifest.jsonl and the merged images/tags/scores folders.
     Resuming is chunk-level and stores cache/state under <local_dir>/.snapshot_cache.
+
+    ``progress_callback`` receives immutable, source-owned observations.  The
+    optional operation and attempt IDs are returned unchanged in each
+    observation so an owning coordinator can bind it to its durable attempt.
+    This loader does not interpret either identifier, create terminal status,
+    or infer totals that the manifest and transfer callbacks do not expose.
     """
     if not manifest_s3_path or manifest_s3_path.endswith("/"):
         raise ValueError("manifest_s3_path must be an object key, not a prefix")
@@ -733,6 +785,25 @@ def download_snapshot_from_s3(
     chunk_paths = manifest.get("chunk_paths")
     if not isinstance(chunk_paths, list) or not chunk_paths:
         raise ValueError("manifest.json must include a non-empty chunk_paths list")
+
+    # Surface a successful manifest read before the per-chunk head requests.
+    # There are no worker callbacks yet, so this direct callback is serialized
+    # with every later one by program order.
+    if progress_callback is not None:
+        progress_callback(
+            SnapshotTransferProgress(
+                phase=SnapshotTransferPhase.MANIFEST_READ,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                network_bytes=0,
+                verified_bytes=0,
+                total_bytes=None,
+                completed_chunks=0,
+                total_chunks=len(chunk_paths),
+                completed_items=0,
+                total_items=None,
+            )
+        )
 
     prefix = posixpath.dirname(manifest_s3_path)
 
@@ -813,6 +884,7 @@ def download_snapshot_from_s3(
         staging_dir: str
         file_paths: list[str]
         manifest_blob: bytes
+        item_count: int
 
     chunk_plans: list[_ChunkPlan] = []
     for index, chunk_path in enumerate(chunk_paths):
@@ -852,6 +924,164 @@ def download_snapshot_from_s3(
 
     chunks_to_download = [plan for plan in chunk_plans if not plan.skip_processing]
 
+    def _count_existing_manifest_items(path: str) -> int:
+        with open(path, "rb") as merged_manifest:
+            return sum(1 for line in merged_manifest if line.strip())
+
+    class _SnapshotProgressReporter:
+        """Serialize worker callbacks into monotone source observations."""
+
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self._network_bytes = 0
+            self._verified_bytes = 0
+            self._verified_sizes_unknown = False
+            self._verified_chunks: set[int] = set()
+            self._completed_chunks = sum(
+                1 for plan in chunk_plans if plan.skip_processing
+            )
+            self._total_chunks = len(chunk_plans)
+            self._completed_items = _count_existing_manifest_items(
+                merged_manifest_path
+            )
+            self._discovered_items = self._completed_items
+            self._inspected_chunks: set[int] = set()
+            self._chunks_to_inspect = len(chunks_to_download)
+            self._total_items: Optional[int] = (
+                self._completed_items if self._chunks_to_inspect == 0 else None
+            )
+            content_lengths = [plan.content_length for plan in chunk_plans]
+            self._total_bytes: Optional[int] = (
+                sum(content_lengths)
+                if all(length is not None for length in content_lengths)
+                else None
+            )
+
+            for plan in chunk_plans:
+                if not plan.skip_processing:
+                    continue
+                if plan.content_length is not None:
+                    self._register_verified_chunk_locked(
+                        plan.index,
+                        plan.content_length,
+                    )
+                elif os.path.isfile(plan.cache_path):
+                    self._register_verified_chunk_locked(
+                        plan.index,
+                        os.path.getsize(plan.cache_path),
+                    )
+                else:
+                    self._register_verified_chunk_locked(plan.index, None)
+
+        def _register_verified_chunk_locked(
+            self,
+            chunk_index: int,
+            size: Optional[int],
+        ) -> None:
+            if chunk_index in self._verified_chunks:
+                return
+            self._verified_chunks.add(chunk_index)
+            if size is None:
+                self._verified_sizes_unknown = True
+                return
+            if size < 0:
+                raise ValueError("Verified chunk size must be non-negative")
+            self._verified_bytes += size
+            if (
+                self._total_bytes is not None
+                and self._verified_bytes > self._total_bytes
+            ):
+                raise RuntimeError("Verified snapshot bytes exceed the known total")
+
+        def _snapshot_locked(
+            self,
+            phase: SnapshotTransferPhase,
+        ) -> SnapshotTransferProgress:
+            return SnapshotTransferProgress(
+                phase=phase,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                network_bytes=self._network_bytes,
+                verified_bytes=(
+                    None if self._verified_sizes_unknown else self._verified_bytes
+                ),
+                total_bytes=self._total_bytes,
+                completed_chunks=self._completed_chunks,
+                total_chunks=self._total_chunks,
+                completed_items=self._completed_items,
+                total_items=self._total_items,
+            )
+
+        def emit(self, phase: SnapshotTransferPhase) -> None:
+            if progress_callback is None:
+                return
+            with self._lock:
+                progress_callback(self._snapshot_locked(phase))
+
+        def record_network_bytes(self, byte_count: int) -> None:
+            if byte_count < 0:
+                raise ValueError("Chunk transfer callback reported negative bytes")
+            with self._lock:
+                self._network_bytes += byte_count
+                if progress_callback is not None:
+                    progress_callback(
+                        self._snapshot_locked(SnapshotTransferPhase.CHUNK_TRANSFER)
+                    )
+
+        def record_verified_chunk(self, chunk_index: int, size: int) -> None:
+            with self._lock:
+                self._register_verified_chunk_locked(chunk_index, size)
+                if progress_callback is not None:
+                    progress_callback(
+                        self._snapshot_locked(SnapshotTransferPhase.CHUNK_TRANSFER)
+                    )
+
+        def record_extracted_items(self, chunk_index: int, item_count: int) -> None:
+            if item_count < 0:
+                raise ValueError("Extracted item count must be non-negative")
+            with self._lock:
+                if chunk_index in self._inspected_chunks:
+                    return
+                self._inspected_chunks.add(chunk_index)
+                self._discovered_items += item_count
+                if len(self._inspected_chunks) == self._chunks_to_inspect:
+                    self._total_items = self._discovered_items
+                if progress_callback is not None:
+                    progress_callback(
+                        self._snapshot_locked(SnapshotTransferPhase.EXTRACTION)
+                    )
+
+        def record_merged_chunk(self, item_count: int) -> None:
+            if item_count < 0:
+                raise ValueError("Merged item count must be non-negative")
+            with self._lock:
+                self._completed_chunks += 1
+                self._completed_items += item_count
+                if self._completed_chunks > self._total_chunks:
+                    raise RuntimeError("Completed chunks exceed the manifest total")
+                if (
+                    self._total_items is not None
+                    and self._completed_items > self._total_items
+                ):
+                    raise RuntimeError("Completed items exceed the manifest total")
+                if progress_callback is not None:
+                    progress_callback(
+                        self._snapshot_locked(SnapshotTransferPhase.ORDERED_MERGE)
+                    )
+
+        def record_completed(self) -> None:
+            with self._lock:
+                # A successful merge reveals the exact item total even when a
+                # prior resume used an older cache state without item metadata.
+                self._total_items = self._completed_items
+                if progress_callback is not None:
+                    progress_callback(
+                        self._snapshot_locked(SnapshotTransferPhase.COMPLETED)
+                    )
+
+    progress = _SnapshotProgressReporter()
+    progress.emit(SnapshotTransferPhase.CHUNK_TRANSFER)
+
     def _ensure_chunk_cache(plan: _ChunkPlan) -> None:
         cache_is_valid = False
         if os.path.exists(plan.cache_path) and os.path.isfile(plan.cache_path):
@@ -860,11 +1090,17 @@ def download_snapshot_from_s3(
                 cache_is_valid = os.path.getsize(plan.cache_path) == plan.content_length
 
         if cache_is_valid:
+            progress.record_verified_chunk(plan.index, os.path.getsize(plan.cache_path))
             return
 
         chunk_tmp_path = f"{plan.cache_path}.download"
         try:
-            s3_client.download_file(bucket, plan.chunk_key, chunk_tmp_path)
+            s3_client.download_file(
+                bucket,
+                plan.chunk_key,
+                chunk_tmp_path,
+                Callback=progress.record_network_bytes,
+            )
             os.replace(chunk_tmp_path, plan.cache_path)
         finally:
             if os.path.exists(chunk_tmp_path):
@@ -875,6 +1111,7 @@ def download_snapshot_from_s3(
 
         if plan.content_length is not None and os.path.getsize(plan.cache_path) != plan.content_length:
             raise RuntimeError(f"Downloaded chunk size mismatch: s3://{bucket}/{plan.chunk_key}")
+        progress.record_verified_chunk(plan.index, os.path.getsize(plan.cache_path))
 
     download_progress = tqdm(total=len(chunks_to_download), unit="chunk", desc="chunk cache")
     try:
@@ -962,6 +1199,7 @@ def download_snapshot_from_s3(
             staging_dir=staging_dir,
             file_paths=inspection.file_paths,
             manifest_blob=inspection.manifest_blob,
+            item_count=inspection.item_count,
         )
 
     max_pending_prepared = max(prefetch_chunks, extract_workers * 2)
@@ -981,7 +1219,9 @@ def download_snapshot_from_s3(
     chunk_progress = tqdm(total=len(chunk_paths), unit="chunk", desc="chunks")
     try:
         with ThreadPoolExecutor(max_workers=extract_workers) as extract_pool:
+            progress.emit(SnapshotTransferPhase.EXTRACTION)
             _fill_pending(extract_pool)
+            progress.emit(SnapshotTransferPhase.ORDERED_MERGE)
             with open(merged_manifest_path, "ab") as merged_manifest:
                 for plan in chunk_plans:
                     if plan.skip_processing:
@@ -996,6 +1236,10 @@ def download_snapshot_from_s3(
 
                     try:
                         prepared = future.result()
+                        progress.record_extracted_items(
+                            prepared.index,
+                            prepared.item_count,
+                        )
                     except Exception as exc:
                         stream_error = (
                             f"Failed to extract chunk {plan.index + 1}/{len(chunk_paths)}: {exc}"
@@ -1026,6 +1270,7 @@ def download_snapshot_from_s3(
                         "content_length": plan.content_length,
                     }
                     _save_json_atomic(state_path, existing_state)
+                    progress.record_merged_chunk(prepared.item_count)
                     chunk_progress.update(1)
                     _fill_pending(extract_pool)
 
@@ -1040,4 +1285,5 @@ def download_snapshot_from_s3(
         print(f"[WARN] Snapshot download failed: {stream_error}")
         return False
 
+    progress.record_completed()
     return True
